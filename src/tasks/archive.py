@@ -4,7 +4,8 @@ Periodic archival Celery tasks.
 Tasks:
   - archive_stale_alerts: once per day, archive alerts whose linked event's
     lastSignalCreatedAt is older than the configured retention window
-    (default 14 days). Calls the archiveStaleAlerts mutation on clear-api.
+    (default 7 days, matching the v2 grouping window). Calls the
+    archiveStaleAlerts mutation on clear-api.
 """
 
 import logging
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
     max_retries=2,
     acks_late=True,
 )
-def archive_stale_alerts(self, older_than_days: int = 14) -> dict:
+def archive_stale_alerts(self, older_than_days: int = 7) -> dict:
     """Archive alerts whose event.lastSignalCreatedAt < now - N days."""
     logger.info("[ARCHIVE] archive_stale_alerts: older_than_days=%d", older_than_days)
     try:

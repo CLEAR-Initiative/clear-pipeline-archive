@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     #   "v2"           — new district+type grouping (EventClassifier + Claude rewrite only).
     grouping_algo: str = "v1"
 
+    # Suppress alert escalation (and the email fan-out it triggers) when the
+    # signal's publishedAt is older than this many hours. Backdated Dataminr
+    # alerts and replayed signals were firing immediate emails for week-old
+    # incidents, which the analyst team experiences as "wrong alert" — the
+    # email is technically correct but stale. Set to 0 to disable the gate.
+    alert_max_signal_age_hours: int = 48
+
     # Last-resort default for `events.population_displaced` when neither
     # the signal text nor the admin-2 DTM row provides a value.
     default_population_displaced: int = 1670
@@ -118,9 +125,18 @@ class Settings(BaseSettings):
     # are out-of-date and dominate when no filter is applied.
     iom_dtm_operation: str = "Armed Clashes in Sudan (Overview)"
     # Optional lower bound on round number. Leave unset (0/None) to fetch all
-    # rounds and let `latest_round_per_pcode` pick the newest per pcode — that
-    # gives us full backtrack history. Set to a specific round to constrain.
+    # rounds and let the aggregator pick the newest per pcode — that gives
+    # us full backtrack history. Set to a specific round to constrain.
     iom_dtm_from_round: int = 0
+    # DTM returns one row per (destination × origin × reason × assessmentType).
+    # Comma-separated priority list: BA (Baseline Assessment = current IDP
+    # stock) fills each pcode first; FM (Flow Monitoring = transit) fills the
+    # remaining gaps. This avoids the BA+FM double-count while picking up
+    # districts that only have FM data (Khartoum, At Tina, etc.). Each upserted
+    # row records which assessmentType produced it. Set to empty string to
+    # disable filtering and pool all types — only safe when the data has no
+    # BA/FM overlap.
+    iom_dtm_assessment_type: str = "BA,FM"
 
     model_config = {
         "env_file": ".env",

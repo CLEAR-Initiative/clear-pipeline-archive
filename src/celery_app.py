@@ -74,11 +74,12 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=7, minute=0, day_of_month=1),
     },
     # Daily archival — 03:00 UTC, archive alerts whose event last saw
-    # a signal more than 14 days ago.
+    # a signal more than 7 days ago (matches the v2 grouping window so an
+    # event stops accepting new signals and gets archived on the same cadence).
     "archive-stale-alerts": {
         "task": "src.tasks.archive.archive_stale_alerts",
         "schedule": crontab(hour=3, minute=0),
-        "kwargs": {"older_than_days": 14},
+        "kwargs": {"older_than_days": 7},
     },
     # Weekly IOM DTM backfill — Mondays at 02:00 UTC. Refreshes
     # locationMetadata(type="iom_dtm_displacement") per admin-2.

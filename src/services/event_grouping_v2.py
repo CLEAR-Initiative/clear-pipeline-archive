@@ -52,7 +52,11 @@ _redis = redis.from_url(settings.redis_url, decode_responses=True)
 
 ACTIVE_EVENTS_CACHE_KEY_V2 = "events:active:v2"
 ACTIVE_EVENTS_TTL_V2 = 300  # 5 min
-ACTIVE_EVENTS_WINDOW_DAYS = 14  # Must match the archival window
+# How long an event stays "active" for incoming signals to attach to. Beyond
+# this, a new signal creates a fresh event instead of merging into an old one.
+# Shorter window = more distinct events, less risk of unrelated incidents
+# getting grouped just because they share district+type.
+ACTIVE_EVENTS_WINDOW_DAYS = 7
 
 IOM_DTM_METADATA_TYPE = "iom_dtm_displacement"
 

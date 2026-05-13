@@ -229,6 +229,7 @@ def process_signal(self, signal_data: dict):
                 event=event,
                 signal_summaries=[classification.summary],
                 max_severity=classification.severity,
+                signal_published_at=signal.alertTimestamp,
             )
 
         return {
@@ -472,6 +473,7 @@ def process_gdacs_signal(
                 event=event,
                 signal_summaries=[classification.summary],
                 max_severity=severity,
+                signal_published_at=gdacs_event.get("from_date"),
             )
 
         return {
@@ -573,6 +575,7 @@ def process_acled_signal(
                 event=event,
                 signal_summaries=[classification.summary],
                 max_severity=severity,
+                signal_published_at=acled_event.get("event_date"),
             )
 
         return {

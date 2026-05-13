@@ -29,7 +29,7 @@ of common candidates and fall back gracefully when values are missing.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 
@@ -162,10 +162,17 @@ def extract_displacement_value(record: dict) -> int | None:
 
 
 def latest_round_per_pcode(records: list[dict], admin_level: int) -> dict[str, dict]:
-    """Group records by `admin{level}Pcode` and keep the record with the
+    """DEPRECATED — use `aggregate_displacement_by_destination` instead.
+
+    Group records by `admin{level}Pcode` and keep the record with the
     highest `roundNumber` (tie-break by `reportingDate`).
 
     Returns `{pcode: record}` — pcodes with no value are dropped.
+
+    Why deprecated: DTM returns one row per (destination, origin admin1,
+    reason, assessment type). Keeping a single record per pcode silently
+    drops every-row-but-one of the same destination's IDP count. The
+    aggregator below sums them properly.
     """
     key_camel = f"admin{admin_level}Pcode"
     key_pascal = f"Admin{admin_level}Pcode"
@@ -191,6 +198,179 @@ def latest_round_per_pcode(records: list[dict], admin_level: int) -> dict[str, d
 def latest_round_per_admin2(records: list[dict]) -> dict[str, dict]:
     """Backwards-compatible shim — level-2 specific wrapper."""
     return latest_round_per_pcode(records, admin_level=2)
+
+
+# ─── Aggregator (the correct way to summarise DTM data) ────────────────────
+class AggregatedDisplacement(TypedDict):
+    """Per-destination summary returned by aggregate_displacement_by_destination."""
+    admin_pcode: str
+    admin_name: str | None
+    round_number: int
+    reporting_date: str | None
+    operation: str | None
+    # Which assessmentType produced this row (e.g. "BA", "FM"). None when the
+    # caller passed assessment_type_filter=None (no filter applied).
+    assessment_type: str | None
+    population_displaced: int  # total IDPs at the destination, summed across all origins
+    origin_breakdown: list[dict[str, Any]]  # [{origin_admin1_pcode, origin_admin1_name, count}, ...]
+
+
+def _aggregate_for_type(
+    records: list[dict],
+    admin_level: int,
+    assessment_type: str | None,
+) -> dict[str, AggregatedDisplacement]:
+    """Single-pass aggregation for one assessmentType (or all if None).
+
+    Same logic as the public aggregator used to inline — extracted so the
+    public function can chain multiple passes (BA → FM fallback)."""
+    key_camel = f"admin{admin_level}Pcode"
+    key_pascal = f"Admin{admin_level}Pcode"
+    name_camel = f"admin{admin_level}Name"
+    name_pascal = f"Admin{admin_level}Name"
+
+    # Stage 1 — group by (pcode, round). Each bucket accumulates a total +
+    # an origin-keyed sub-tally + the metadata we need for the payload.
+    buckets: dict[tuple[str, int], dict[str, Any]] = {}
+
+    for rec in records:
+        if assessment_type is not None:
+            rec_type = rec.get("assessmentType") or rec.get("AssessmentType")
+            if rec_type != assessment_type:
+                continue
+
+        pcode = rec.get(key_camel) or rec.get(key_pascal)
+        if not pcode:
+            continue
+
+        rn_raw = rec.get("roundNumber") or rec.get("RoundNumber") or 0
+        try:
+            rn = int(rn_raw)
+        except (TypeError, ValueError):
+            continue
+
+        ind = extract_displacement_value(rec)
+        if ind is None or ind <= 0:
+            continue
+
+        key = (pcode, rn)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = {
+                "admin_pcode": pcode,
+                "admin_name": rec.get(name_camel) or rec.get(name_pascal),
+                "round_number": rn,
+                "reporting_date": rec.get("reportingDate") or rec.get("ReportingDate"),
+                "operation": rec.get("operation") or rec.get("Operation"),
+                "assessment_type": assessment_type,
+                "population_displaced": 0,
+                # origin admin1 pcode → {name, count}
+                "_origins": {},
+            }
+            buckets[key] = bucket
+
+        bucket["population_displaced"] += ind
+
+        origin_pcode = rec.get("idpOriginAdmin1Pcode") or rec.get("IdpOriginAdmin1Pcode")
+        if origin_pcode:
+            origin_name = (
+                rec.get("idpOriginAdmin1Name")
+                or rec.get("IdpOriginAdmin1Name")
+            )
+            existing = bucket["_origins"].get(origin_pcode)
+            if existing is None:
+                bucket["_origins"][origin_pcode] = {"name": origin_name, "count": ind}
+            else:
+                existing["count"] += ind
+                # Prefer the first non-null name we saw — names should be
+                # consistent across rows but be defensive.
+                if existing["name"] is None and origin_name is not None:
+                    existing["name"] = origin_name
+
+    # Stage 2 — collapse to one bucket per pcode (latest round wins).
+    latest: dict[str, AggregatedDisplacement] = {}
+    for (pcode, rn), bucket in buckets.items():
+        cur = latest.get(pcode)
+        if cur is None or rn > cur["round_number"] or (
+            rn == cur["round_number"]
+            and (bucket["reporting_date"] or "") > (cur["reporting_date"] or "")
+        ):
+            # Materialise the origin breakdown, sorted descending by count
+            # so consumers don't have to.
+            origins = bucket.pop("_origins")
+            origin_list = sorted(
+                (
+                    {
+                        "origin_admin1_pcode": op,
+                        "origin_admin1_name": v["name"],
+                        "count": v["count"],
+                    }
+                    for op, v in origins.items()
+                ),
+                key=lambda x: x["count"],
+                reverse=True,
+            )
+            bucket["origin_breakdown"] = origin_list
+            latest[pcode] = bucket  # type: ignore[assignment]
+
+    return latest
+
+
+def aggregate_displacement_by_destination(
+    records: list[dict],
+    admin_level: int,
+    *,
+    assessment_type_filter: str | list[str] | None = "BA",
+) -> dict[str, AggregatedDisplacement]:
+    """Sum IDP counts per destination admin pcode + build per-origin breakdown.
+
+    DTM admin-level endpoints return one row per
+    (destination_admin{N}, origin_admin1, displacementReason, assessmentType).
+    To get the total IDP count at a destination, we have to sum across origins
+    (and across reasons) for the same destination + round.
+
+    `assessment_type_filter` accepts:
+      - "BA"               — single type (legacy behaviour).
+      - ["BA", "FM"]       — priority list. Aggregate the first type; for
+                             pcodes with no rows there, fall back to the next
+                             type. Avoids double-counting (BA + FM measure
+                             different things) while filling gaps for
+                             districts where only FM data exists.
+      - None               — no filter; pool all assessment types together.
+
+    Each returned bucket records the `assessment_type` that produced it, so
+    consumers can tell whether a number is from BA (current IDP stock) or FM
+    (transit flow) — the two have different semantics.
+
+    Steps (per type):
+      1. Filter to matching `assessmentType` rows.
+      2. Group by (admin{level}Pcode, roundNumber).
+      3. Sum `numPresentIdpInd` across the group → population_displaced.
+      4. Build a per-origin breakdown.
+      5. Pick the latest round per pcode (tie-break by reportingDate).
+
+    Returns `{admin_pcode: AggregatedDisplacement}`. Destinations with zero
+    IDPs (after filtering) are omitted.
+    """
+    if assessment_type_filter is None:
+        return _aggregate_for_type(records, admin_level, None)
+    if isinstance(assessment_type_filter, str):
+        return _aggregate_for_type(records, admin_level, assessment_type_filter)
+
+    # Priority list: first type wins per pcode; subsequent types fill gaps only.
+    merged: dict[str, AggregatedDisplacement] = {}
+    for atype in assessment_type_filter:
+        pass_result = _aggregate_for_type(records, admin_level, atype)
+        added = 0
+        for pcode, bucket in pass_result.items():
+            if pcode not in merged:
+                merged[pcode] = bucket
+                added += 1
+        logger.info(
+            "[IOM DTM] admin%d assessmentType=%r filled %d pcodes (%d already covered)",
+            admin_level, atype, added, len(pass_result) - added,
+        )
+    return merged
 
 
 def record_pcode(record: dict, admin_level: int) -> str | None:
