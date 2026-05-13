@@ -1,6 +1,7 @@
 """Alert escalation service: assess events for alert-worthiness using Claude."""
 
 import logging
+from datetime import UTC, datetime
 
 from src.clients.claude import call_claude
 from src.clients.graphql import create_alert
@@ -9,6 +10,24 @@ from src.models.clear import AlertAssessment
 from src.prompts.assess import ASSESS_PROMPT_VERSION, SYSTEM_PROMPT, build_assess_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def _is_stale_signal(published_at: str | None) -> bool:
+    """True iff the signal's publishedAt is older than the configured
+    staleness threshold. Unparseable or missing timestamps are NOT treated as
+    stale — we'd rather fire a possibly-late alert than swallow it silently
+    when the source omitted a timestamp.
+    """
+    max_age_hours = settings.alert_max_signal_age_hours
+    if max_age_hours <= 0 or not published_at:
+        return False
+    try:
+        # Normalise the trailing "Z" so fromisoformat accepts it on <3.11.
+        ts = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    age_hours = (datetime.now(UTC) - ts).total_seconds() / 3600.0
+    return age_hours > max_age_hours
 
 
 def escalate_to_alert(event: dict, status: str = "published") -> dict:
@@ -29,10 +48,24 @@ def maybe_escalate(
     event: dict,
     signal_summaries: list[str],
     max_severity: int,
+    signal_published_at: str | None = None,
 ) -> dict | None:
     """Dispatcher: v2 skips the Claude gate (severity threshold alone), v1
     still uses `assess_and_escalate` for the Claude alert-worthiness check.
+
+    `signal_published_at` is the source-reported timestamp of the triggering
+    signal (Dataminr alertTimestamp / GDACS from_date / ACLED event_date).
+    When provided, escalation is suppressed for signals older than
+    `settings.alert_max_signal_age_hours` so backdated/replayed alerts don't
+    fan out as immediate emails.
     """
+    if _is_stale_signal(signal_published_at):
+        logger.info(
+            "[ALERT] Skipping escalation for event %s — signal publishedAt=%s "
+            "is older than %dh (staleness gate)",
+            event["id"], signal_published_at, settings.alert_max_signal_age_hours,
+        )
+        return None
     if settings.grouping_algo == "v2":
         return escalate_to_alert(event)
     return assess_and_escalate(

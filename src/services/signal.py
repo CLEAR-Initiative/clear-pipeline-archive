@@ -182,26 +182,9 @@ def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
 
     if has_coords:
         # Dataminr has coordinates — let the API's PostGIS geo-resolution handle it.
-        # Still use Claude to determine if it's displacement (for origin/destination).
-        loc_result = resolve_signal_location(
-            title=signal.headline,
-            description=description,
-            dataminr_location_name=dataminr_location_name,
-        )
-        if loc_result["location_type"] == "displacement":
-            # Displacement: set origin/destination from Claude, lat/lng stays for API fallback
-            if loc_result["origin_id"]:
-                input_data["originId"] = loc_result["origin_id"]
-            if loc_result["destination_id"]:
-                input_data["destinationId"] = loc_result["destination_id"]
-            logger.info(
-                "Displacement signal (with coords): origin=%s destination=%s",
-                loc_result["origin_id"],
-                loc_result["destination_id"],
-            )
-        else:
-            # General with coords: let PostGIS resolve locationId from lat/lng
-            logger.info("General signal: using lat/lng for PostGIS resolution")
+        # Skip the Claude displacement check: origin/destination aren't used downstream
+        # yet, so the LLM call is wasted credits.
+        logger.info("Signal has coords: using lat/lng for PostGIS resolution")
     else:
         # No coordinates — use Claude to resolve location from text
         loc_result = resolve_signal_location(

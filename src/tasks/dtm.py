@@ -48,9 +48,15 @@ def _process_level(
     admin0_pcode: str,
     operation: str | None,
     from_round: int | None,
+    assessment_type_filter: str | list[str] | None = "BA",
 ) -> dict:
-    """Fetch the latest DTM round per pCode at `admin_level` and bulk-upsert
-    into location_metadata. Returns per-level stats."""
+    """Fetch DTM rows at `admin_level`, sum IDPs per destination across
+    origins, and bulk-upsert into location_metadata. Returns per-level stats.
+
+    `assessment_type_filter` accepts a single assessmentType, a priority list
+    (e.g. ["BA", "FM"] — BA fills first, FM fills the gaps), or None to pool
+    all types. Each upserted row records which type produced it.
+    """
     stats = {
         "fetched": 0,
         "distinct": 0,
@@ -70,22 +76,31 @@ def _process_level(
     )
     stats["fetched"] = len(records)
 
-    latest = iom_dtm.latest_round_per_pcode(records, admin_level=admin_level)
+    # Aggregate: sum across (origin admin1, displacement reason) per
+    # (destination admin{N}, round), keep latest round per destination.
+    latest = iom_dtm.aggregate_displacement_by_destination(
+        records,
+        admin_level=admin_level,
+        assessment_type_filter=assessment_type_filter,
+    )
     stats["distinct"] = len(latest)
     logger.info(
-        "[IOM DTM L%d] latest round per pCode: %d distinct",
-        admin_level, len(latest),
+        "[IOM DTM L%d] aggregated %d destinations from %d raw rows (assessment=%s)",
+        admin_level, len(latest), len(records), assessment_type_filter,
     )
 
     # CLEAR locations at this level — build pCode and name lookup maps.
-    # The name map is a fallback for cases where pCode format differs between
-    # IOM and CLEAR (e.g. admin0: IOM returns "SD" but CLEAR stored "SDN").
+    # ISO2 map (admin0 only) handles "SD" ↔ "SDN" drift in either direction.
+    # Name map handles everything else.
     clear_rows = graphql.get_locations_by_level(admin_level)
     pcode_to_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
+    iso2_to_id: dict[str, str] = {}
     for loc in clear_rows:
         if loc.get("pCode"):
             pcode_to_id[loc["pCode"]] = loc["id"]
+            if admin_level == 0:
+                iso2_to_id[loc["pCode"][:2].upper()] = loc["id"]
         if loc.get("name"):
             name_to_id[_normalise_name(loc["name"])] = loc["id"]
     logger.info(
@@ -94,11 +109,19 @@ def _process_level(
     )
 
     batch: list[dict] = []
-    for pcode, rec in latest.items():
+    for pcode, agg in latest.items():
         clear_id = pcode_to_id.get(pcode)
+        if not clear_id and admin_level == 0:
+            # ISO2/ISO3 drift: IOM "SDN" ↔ CLEAR "SD" (or vice versa).
+            clear_id = iso2_to_id.get(pcode[:2].upper())
+            if clear_id:
+                logger.info(
+                    "[IOM DTM L%d ISO2-MATCH] pCode=%s → %s (matched on '%s')",
+                    admin_level, pcode, clear_id, pcode[:2].upper(),
+                )
         if not clear_id:
-            # Name-based fallback
-            rec_name = iom_dtm.record_name(rec, admin_level)
+            # Name-based fallback for non-admin0 pCode drift.
+            rec_name = agg["admin_name"]
             if rec_name:
                 clear_id = name_to_id.get(_normalise_name(rec_name))
                 if clear_id:
@@ -111,23 +134,26 @@ def _process_level(
             stats["unmatched_pcode"] += 1
             logger.debug(
                 "[IOM DTM L%d] No CLEAR location for pCode=%s name=%s",
-                admin_level, pcode, iom_dtm.record_name(rec, admin_level),
+                admin_level, pcode, agg["admin_name"],
             )
             continue
 
-        value = iom_dtm.extract_displacement_value(rec)
-        if value is None:
+        if agg["population_displaced"] <= 0:
             stats["skipped_no_value"] += 1
             continue
 
         payload = {
-            "population_displaced": value,
-            "round_number": rec.get("roundNumber") or rec.get("RoundNumber"),
-            "reporting_date": rec.get("reportingDate") or rec.get("ReportingDate"),
-            "operation": rec.get("operation") or rec.get("Operation"),
+            "population_displaced": agg["population_displaced"],
+            # Per-origin breakdown — sorted desc by count. Empty list when
+            # the operation doesn't expose origin info (e.g. older datasets).
+            "origin_breakdown": agg["origin_breakdown"],
+            "round_number": agg["round_number"],
+            "reporting_date": agg["reporting_date"],
+            "operation": agg["operation"],
             "admin_level": admin_level,
-            "admin_name": iom_dtm.record_name(rec, admin_level),
+            "admin_name": agg["admin_name"],
             "admin_pcode": pcode,
+            "assessment_type": agg["assessment_type"],
             "source": "iom_dtm_v3",
         }
         stats["matched"] += 1
@@ -167,6 +193,7 @@ def backfill_dtm_displacement(
     admin0_pcode: str | None = None,
     operation: str | None = None,
     from_round: int | None = None,
+    assessment_type: str | None = None,
     levels: list[int] | None = None,
 ) -> dict:
     """Fetch IOM DTM displacement data at admin levels 0, 1, and 2 and upsert
@@ -175,6 +202,10 @@ def backfill_dtm_displacement(
     `levels` lets callers scope to specific levels (default: all three).
     `operation` overrides settings.iom_dtm_operation.
     `from_round` overrides settings.iom_dtm_from_round.
+    `assessment_type` overrides settings.iom_dtm_assessment_type. Accepts a
+        single type ("BA") or a comma-separated priority list ("BA,FM"): the
+        first type fills each pcode, later types fill remaining gaps.
+        Empty string pools all types (only safe when BA/FM don't overlap).
     Returns per-level stats plus a top-level "total_upserted" convenience count.
     """
     country = country_name or settings.iom_dtm_country_name
@@ -183,6 +214,21 @@ def backfill_dtm_displacement(
     # 0 in settings means "no lower bound" — treat as None for the API call.
     fr_setting = from_round if from_round is not None else settings.iom_dtm_from_round
     fr = fr_setting if fr_setting and fr_setting > 0 else None
+    at_setting = assessment_type if assessment_type is not None else settings.iom_dtm_assessment_type
+    # Setting accepts a comma-separated priority list ("BA,FM"). Single value
+    # stays a string; multiple become a list so the aggregator runs the BA→FM
+    # fallback. Empty string disables filtering entirely.
+    at: str | list[str] | None
+    if not at_setting:
+        at = None
+    else:
+        parts = [t.strip() for t in at_setting.split(",") if t.strip()]
+        if len(parts) == 0:
+            at = None
+        elif len(parts) == 1:
+            at = parts[0]
+        else:
+            at = parts
     target_levels = levels or [0, 1, 2]
 
     if not settings.iom_dtm_subscription_key:
@@ -190,8 +236,8 @@ def backfill_dtm_displacement(
         return {"skipped": "no_subscription_key"}
 
     logger.info(
-        "[IOM DTM] backfill country=%s admin0=%s operation=%r from_round=%s levels=%s",
-        country, admin0, op, fr, target_levels,
+        "[IOM DTM] backfill country=%s admin0=%s operation=%r from_round=%s assessment=%s levels=%s",
+        country, admin0, op, fr, at, target_levels,
     )
 
     all_stats: dict = {}
@@ -200,7 +246,7 @@ def backfill_dtm_displacement(
             if lvl not in _LEVEL_FETCH:
                 logger.warning("[IOM DTM] Unsupported admin level %s — skipping", lvl)
                 continue
-            all_stats[f"admin{lvl}"] = _process_level(lvl, country, admin0, op, fr)
+            all_stats[f"admin{lvl}"] = _process_level(lvl, country, admin0, op, fr, at)
 
         all_stats["total_upserted"] = sum(
             s.get("upserted", 0) for s in all_stats.values() if isinstance(s, dict)

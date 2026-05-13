@@ -79,6 +79,7 @@ def run_level(
     admin0_pcode: str,
     operation: str | None,
     from_round: int | None,
+    assessment_type_filter: str | list[str] | None,
     dry_run: bool,
 ) -> dict:
     stats = {
@@ -98,8 +99,8 @@ def run_level(
     fetch = _LEVEL_FETCH[admin_level]
     logger.info("=" * 60)
     logger.info(
-        "Level %d — fetching IOM DTM admin%d for %s (operation=%r from_round=%s)…",
-        admin_level, admin_level, country_name, operation, from_round,
+        "Level %d — fetching IOM DTM admin%d for %s (operation=%r from_round=%s assessment=%s)…",
+        admin_level, admin_level, country_name, operation, from_round, assessment_type_filter,
     )
     records = fetch(
         country_name=country_name,
@@ -113,18 +114,33 @@ def run_level(
         1 for r in records if not iom_dtm.record_pcode(r, admin_level)
     )
 
-    latest = iom_dtm.latest_round_per_pcode(records, admin_level=admin_level)
+    # Aggregate: sum across (origin admin1, displacement reason) per
+    # (destination, round); keep latest round per destination. Filtered to
+    # one assessmentType so BA + FM don't double-count.
+    latest = iom_dtm.aggregate_displacement_by_destination(
+        records,
+        admin_level=admin_level,
+        assessment_type_filter=assessment_type_filter,
+    )
     stats["distinct"] = len(latest)
-    logger.info("Latest round per pCode: %d distinct", len(latest))
+    logger.info(
+        "Aggregated: %d destinations from %d raw rows", len(latest), len(records),
+    )
 
     clear_rows = graphql.get_locations_by_level(admin_level)
     stats["clear_total"] = len(clear_rows)
     pcode_to_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
+    # ISO2 prefix → id, populated only at admin0. CLEAR stores Sudan as "SD"
+    # while IOM DTM returns "SDN" (and historically the inverse). Keying by
+    # the first 2 chars handles both directions cleanly.
+    iso2_to_id: dict[str, str] = {}
     clear_missing_pcode: list[str] = []
     for loc in clear_rows:
         if loc.get("pCode"):
             pcode_to_id[loc["pCode"]] = loc["id"]
+            if admin_level == 0:
+                iso2_to_id[loc["pCode"][:2].upper()] = loc["id"]
         else:
             clear_missing_pcode.append(loc.get("name") or loc["id"])
         if loc.get("name"):
@@ -144,8 +160,12 @@ def run_level(
     clear_no_dtm: list[str] = []
     for loc in clear_rows:
         pcode = loc.get("pCode")
-        if pcode and pcode not in dtm_pcodes:
-            clear_no_dtm.append(f"{loc.get('name')} ({pcode})")
+        if not pcode or pcode in dtm_pcodes:
+            continue
+        # At admin0, treat "SD" and "SDN" as the same row before warning.
+        if admin_level == 0 and any(p[:2].upper() == pcode[:2].upper() for p in dtm_pcodes):
+            continue
+        clear_no_dtm.append(f"{loc.get('name')} ({pcode})")
     stats["clear_with_no_dtm_row"] = len(clear_no_dtm)
     if clear_no_dtm:
         logger.warning(
@@ -154,14 +174,24 @@ def run_level(
         )
 
     batch: list[dict] = []
-    for pcode, rec in latest.items():
+    for pcode, agg in latest.items():
         clear_id = pcode_to_id.get(pcode)
         match_mode = "pcode" if clear_id else None
 
+        if not clear_id and admin_level == 0:
+            # ISO2/ISO3 drift: IOM "SDN" ↔ CLEAR "SD" (or vice versa).
+            candidate = iso2_to_id.get(pcode[:2].upper())
+            if candidate:
+                clear_id = candidate
+                match_mode = "iso2"
+                logger.info(
+                    "[ISO2-MATCH L%d] pCode=%s → CLEAR id=%s (matched on '%s')",
+                    admin_level, pcode, clear_id, pcode[:2].upper(),
+                )
+
         if not clear_id:
-            # Fallback: match by normalised name (handles pCode format drift,
-            # e.g. IOM "SD" vs CLEAR "SDN" at admin0).
-            rec_name = iom_dtm.record_name(rec, admin_level)
+            # Fallback: match by normalised name (handles non-admin0 pCode drift).
+            rec_name = agg["admin_name"]
             if rec_name:
                 candidate = name_to_id.get(_normalise_name(rec_name))
                 if candidate:
@@ -176,36 +206,45 @@ def run_level(
             stats["unmatched_pcode"] += 1
             logger.warning(
                 "[UNMATCHED L%d] pCode=%s name=%s",
-                admin_level, pcode, iom_dtm.record_name(rec, admin_level),
+                admin_level, pcode, agg["admin_name"],
             )
             continue
 
-        value = iom_dtm.extract_displacement_value(rec)
-        if value is None:
+        value = agg["population_displaced"]
+        if value <= 0:
             stats["skipped_no_value"] += 1
             logger.warning(
                 "[NO VALUE L%d] pCode=%s round=%s",
-                admin_level, pcode, rec.get("roundNumber") or rec.get("RoundNumber"),
+                admin_level, pcode, agg["round_number"],
             )
             continue
 
         payload = {
             "population_displaced": value,
-            "round_number": rec.get("roundNumber") or rec.get("RoundNumber"),
-            "reporting_date": rec.get("reportingDate") or rec.get("ReportingDate"),
-            "operation": rec.get("operation") or rec.get("Operation"),
+            "origin_breakdown": agg["origin_breakdown"],
+            "round_number": agg["round_number"],
+            "reporting_date": agg["reporting_date"],
+            "operation": agg["operation"],
             "admin_level": admin_level,
-            "admin_name": iom_dtm.record_name(rec, admin_level),
+            "admin_name": agg["admin_name"],
             "admin_pcode": pcode,
+            "assessment_type": agg["assessment_type"],
             "source": "iom_dtm_v3",
         }
         stats["matched"] += 1
 
         if dry_run:
+            top_origin = (
+                f", top origin: {agg['origin_breakdown'][0]['origin_admin1_name']}"
+                f"={agg['origin_breakdown'][0]['count']}"
+                if agg["origin_breakdown"]
+                else ""
+            )
             logger.info(
-                "[DRY-RUN L%d] pCode=%s → %d displaced (round %s, %s)",
+                "[DRY-RUN L%d] pCode=%s → %d displaced (round %s, %s, %d origins%s)",
                 admin_level, pcode, value,
-                payload["round_number"], payload["reporting_date"],
+                agg["round_number"], agg["reporting_date"],
+                len(agg["origin_breakdown"]), top_origin,
             )
             continue
 
@@ -233,6 +272,7 @@ def run(
     admin0_pcode: str,
     operation: str | None,
     from_round: int | None,
+    assessment_type_filter: str | list[str] | None,
     dry_run: bool,
 ) -> dict:
     if not settings.iom_dtm_subscription_key:
@@ -244,7 +284,8 @@ def run(
     all_stats: dict = {}
     for lvl in levels:
         all_stats[f"admin{lvl}"] = run_level(
-            lvl, country_name, admin0_pcode, operation, from_round, dry_run,
+            lvl, country_name, admin0_pcode, operation, from_round,
+            assessment_type_filter, dry_run,
         )
 
     all_stats["total_upserted"] = sum(
@@ -283,6 +324,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--assessment-type",
+        default=settings.iom_dtm_assessment_type,
+        help=(
+            "Filter rows by assessmentType before summing. Accepts a single "
+            "value ('BA') or a comma-separated priority list ('BA,FM'): the "
+            "first type fills each pcode; later types only fill pcodes the "
+            "earlier types had no rows for. Default: "
+            f"{settings.iom_dtm_assessment_type!r}. Pass an empty string to "
+            "disable filtering and pool all types — only safe when the data "
+            "has no BA/FM overlap (will double-count otherwise)."
+        ),
+    )
+    parser.add_argument(
         "--levels",
         default=None,
         help="Comma-separated admin levels to process (default: 0,1,2).",
@@ -293,13 +347,25 @@ def main() -> None:
     levels = parse_levels(args.levels)
     operation = args.operation or None
     from_round = args.from_round if args.from_round and args.from_round > 0 else None
+    # "" → None (filter disabled); "BA" → "BA"; "BA,FM" → ["BA", "FM"] (priority fallback)
+    assessment_type: str | list[str] | None
+    if not args.assessment_type:
+        assessment_type = None
+    else:
+        parts = [t.strip() for t in args.assessment_type.split(",") if t.strip()]
+        if len(parts) == 0:
+            assessment_type = None
+        elif len(parts) == 1:
+            assessment_type = parts[0]
+        else:
+            assessment_type = parts
 
     logger.info(
-        "Starting IOM DTM backfill: country=%s admin0=%s operation=%r from_round=%s levels=%s dry_run=%s",
-        args.country, args.admin0_pcode, operation, from_round, levels, args.dry_run,
+        "Starting IOM DTM backfill: country=%s admin0=%s operation=%r from_round=%s assessment=%s levels=%s dry_run=%s",
+        args.country, args.admin0_pcode, operation, from_round, assessment_type, levels, args.dry_run,
     )
 
-    stats = run(levels, args.country, args.admin0_pcode, operation, from_round, args.dry_run)
+    stats = run(levels, args.country, args.admin0_pcode, operation, from_round, assessment_type, args.dry_run)
     logger.info("Done: %s", json.dumps(stats, indent=2))
 
 
