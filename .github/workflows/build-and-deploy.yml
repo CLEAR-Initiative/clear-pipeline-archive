@@ -1,0 +1,81 @@
+name: Build & deploy (dev / staging)
+
+# Push to dev → build → deploy to dev VM
+# Push to staging → build → deploy to staging VM
+#
+# Pipeline image is heavier than the others (torch + sentence-transformers
+# pull ~500MB), so we lean on GHA's docker layer cache to keep CI fast.
+
+on:
+  push:
+    branches: [dev, staging]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/clear-pipeline
+
+jobs:
+  build:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: meta
+        run: |
+          echo "sha_tag=${GITHUB_REF_NAME}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        # Same Dockerfile Railway uses on main → one image build, no drift
+        # between Railway and Infomaniak.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to ${{ github.ref_name }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - name: SSH and roll the deployment
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.APP_VM_HOST }}
+          username: ubuntu
+          key: ${{ secrets.APP_VM_SSH_KEY }}
+          script_stop: true
+          # Pipeline workers are stateless — `up -d` does a graceful replace.
+          # Any in-flight Celery task gets retried on the new container per
+          # acks_late=True (already set in src/celery_app.py).
+          script: |
+            set -e
+            cd /srv/app
+            docker compose pull clear-pipeline
+            docker compose up -d clear-pipeline
+            docker image prune -f
+            docker compose ps clear-pipeline
