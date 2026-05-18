@@ -22,7 +22,7 @@ from src.prompts.classify import (
     SYSTEM_PROMPT as CLASSIFY_SYSTEM,
     build_classify_prompt,
 )
-from src.services.alert import maybe_escalate
+from src.services.alert import is_stale_signal, maybe_escalate
 from src.services.event import dispatch_group_signal
 from src.services.local_classify import classify_locally
 from src.services.signal import ingest_signal
@@ -274,6 +274,7 @@ def process_manual_signal(
     description: str,
     severity: int | None = None,
     user_id: str = "",
+    signal_published_at: str | None = None,
 ):
     """
     Process a manually created signal from a trusted source:
@@ -357,20 +358,38 @@ def process_manual_signal(
             }
 
         # ─── Stage 3: Auto-escalate for trusted sources ──────────────────────
+        # Two gates protect against runaway notifications:
+        #   1. Severity floor — matches the >=4 gate the auto-poll paths
+        #      (Dataminr/GDACS/ACLED) apply. A low-severity manual report
+        #      shouldn't email every subscriber.
+        #   2. Staleness gate — a manual report about a week-old incident
+        #      shouldn't fan out as a live alert; same threshold the
+        #      maybe_escalate path uses for auto-polled signals.
         escalated = False
-        if source_type in TRUSTED_SOURCE_NAMES:
+        if source_type not in TRUSTED_SOURCE_NAMES:
+            pass  # only trusted sources auto-escalate at all
+        elif classification.severity < 4:
+            logger.info(
+                "[ALERT] Manual signal %s: skipping auto-escalation (severity=%d < 4)",
+                signal_id, classification.severity,
+            )
+        elif is_stale_signal(signal_published_at):
+            logger.info(
+                "[ALERT] Manual signal %s: skipping auto-escalation — "
+                "publishedAt=%s is older than %dh",
+                signal_id, signal_published_at, settings.alert_max_signal_age_hours,
+            )
+        else:
             logger.info(
                 "Trusted source (%s) — auto-escalating event %s to alert",
-                source_type,
-                event["id"],
+                source_type, event["id"],
             )
             try:
                 escalation = escalate_event(event["id"], user_id)
                 escalated = True
                 logger.info(
                     "Event %s escalated: escalation_id=%s",
-                    event["id"],
-                    escalation["id"],
+                    event["id"], escalation["id"],
                 )
             except Exception as e:
                 logger.error("Failed to escalate event %s: %s", event["id"], e)

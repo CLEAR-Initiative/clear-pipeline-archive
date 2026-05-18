@@ -30,7 +30,7 @@ def _iso_z(ts: datetime) -> str:
     return ts.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-# ─── _is_stale_signal ──────────────────────────────────────────────────────
+# ─── is_stale_signal ──────────────────────────────────────────────────────
 
 
 class TestIsStaleSignal:
@@ -44,34 +44,34 @@ class TestIsStaleSignal:
     def test_disabled_when_threshold_is_zero(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 0)
         ancient = _iso(datetime.now(UTC) - timedelta(days=365))
-        assert alert_service._is_stale_signal(ancient) is False
+        assert alert_service.is_stale_signal(ancient) is False
 
     def test_returns_false_when_published_at_is_none(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
-        assert alert_service._is_stale_signal(None) is False
+        assert alert_service.is_stale_signal(None) is False
 
     def test_returns_false_when_published_at_is_empty_string(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
-        assert alert_service._is_stale_signal("") is False
+        assert alert_service.is_stale_signal("") is False
 
     def test_returns_false_when_published_at_is_unparseable(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
-        assert alert_service._is_stale_signal("not a timestamp") is False
+        assert alert_service.is_stale_signal("not a timestamp") is False
 
     def test_fresh_signal_within_threshold(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
         recent = _iso(datetime.now(UTC) - timedelta(hours=12))
-        assert alert_service._is_stale_signal(recent) is False
+        assert alert_service.is_stale_signal(recent) is False
 
     def test_signal_just_inside_threshold_is_not_stale(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
         boundary = _iso(datetime.now(UTC) - timedelta(hours=47, minutes=59))
-        assert alert_service._is_stale_signal(boundary) is False
+        assert alert_service.is_stale_signal(boundary) is False
 
     def test_signal_beyond_threshold_is_stale(self, monkeypatch):
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
         old = _iso(datetime.now(UTC) - timedelta(hours=72))
-        assert alert_service._is_stale_signal(old) is True
+        assert alert_service.is_stale_signal(old) is True
 
     def test_handles_dataminr_z_suffix(self, monkeypatch):
         """Dataminr serialises timestamps with trailing Z. fromisoformat on
@@ -79,7 +79,7 @@ class TestIsStaleSignal:
         in the helper. Lock in the behaviour with a regression test."""
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
         week_old = _iso_z(datetime.now(UTC) - timedelta(days=7))
-        assert alert_service._is_stale_signal(week_old) is True
+        assert alert_service.is_stale_signal(week_old) is True
 
     def test_future_timestamps_are_not_stale(self, monkeypatch):
         """A future publishedAt yields a negative age — must not be classed
@@ -87,7 +87,7 @@ class TestIsStaleSignal:
         clock-skew edge cases is cheap."""
         monkeypatch.setattr(alert_service.settings, "alert_max_signal_age_hours", 48)
         tomorrow = _iso(datetime.now(UTC) + timedelta(hours=1))
-        assert alert_service._is_stale_signal(tomorrow) is False
+        assert alert_service.is_stale_signal(tomorrow) is False
 
 
 # ─── maybe_escalate ────────────────────────────────────────────────────────

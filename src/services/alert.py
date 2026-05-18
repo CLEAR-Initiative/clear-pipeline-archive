@@ -12,7 +12,7 @@ from src.prompts.assess import ASSESS_PROMPT_VERSION, SYSTEM_PROMPT, build_asses
 logger = logging.getLogger(__name__)
 
 
-def _is_stale_signal(published_at: str | None) -> bool:
+def is_stale_signal(published_at: str | None) -> bool:
     """True iff the signal's publishedAt is older than the configured
     staleness threshold. Unparseable or missing timestamps are NOT treated as
     stale — we'd rather fire a possibly-late alert than swallow it silently
@@ -59,7 +59,7 @@ def maybe_escalate(
     `settings.alert_max_signal_age_hours` so backdated/replayed alerts don't
     fan out as immediate emails.
     """
-    if _is_stale_signal(signal_published_at):
+    if is_stale_signal(signal_published_at):
         logger.info(
             "[ALERT] Skipping escalation for event %s — signal publishedAt=%s "
             "is older than %dh (staleness gate)",
