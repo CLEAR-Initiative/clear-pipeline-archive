@@ -82,5 +82,8 @@ jobs:
             cd /srv/app
             docker compose pull clear-pipeline
             docker compose up -d clear-pipeline
-            docker image prune -f
+            # Aggressive prune: remove every image not currently in use by a
+            # running container (not just dangling). Keeps the 20 GB root disk
+            # from filling up as old :dev tags accumulate over many deploys.
+            docker image prune -a -f
             docker compose ps clear-pipeline
