@@ -602,3 +602,67 @@ def get_all_location_metadata(type_: str) -> list[dict]:
     """Return every locationMetadata row of a given type across all locations."""
     result = _execute(ALL_LOCATION_METADATA, {"type": type_})
     return result.get("allLocationMetadata", []) or []
+
+
+# ─── Nominatim geocoder cache ─────────────────────────────────────────────
+
+GET_NOMINATIM_CACHE_ENTRY = """
+query NominatimCacheEntry($queryHash: String!) {
+  nominatimCacheEntry(queryHash: $queryHash) {
+    id
+    queryHash
+    query
+    endpoint
+    responseJson
+    status
+    fetchedAt
+    expiresAt
+  }
+}
+"""
+
+UPSERT_NOMINATIM_CACHE = """
+mutation UpsertNominatimCache($input: UpsertNominatimCacheInput!) {
+  upsertNominatimCache(input: $input) {
+    id
+    queryHash
+    status
+    expiresAt
+  }
+}
+"""
+
+
+def get_nominatim_cache_entry(query_hash: str) -> dict | None:
+    """Read a cached Nominatim response by query hash. Returns None when the
+    entry is missing or expired (the API filters expired rows server-side)."""
+    result = _execute(GET_NOMINATIM_CACHE_ENTRY, {"queryHash": query_hash})
+    return result.get("nominatimCacheEntry")
+
+
+def upsert_nominatim_cache(
+    *,
+    query_hash: str,
+    query: str,
+    endpoint: str,
+    response_json: dict | list,
+    status: str,
+    ttl_seconds: int,
+) -> dict:
+    """Write a Nominatim response to the cache. `status` is one of
+    'ok' / 'no_result' / 'error'. The server computes expires_at from
+    ttl_seconds."""
+    result = _execute(
+        UPSERT_NOMINATIM_CACHE,
+        {
+            "input": {
+                "queryHash": query_hash,
+                "query": query,
+                "endpoint": endpoint,
+                "responseJson": response_json,
+                "status": status,
+                "ttlSeconds": ttl_seconds,
+            }
+        },
+    )
+    return result["upsertNominatimCache"]

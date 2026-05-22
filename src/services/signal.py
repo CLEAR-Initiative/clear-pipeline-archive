@@ -5,6 +5,7 @@ import re
 
 from src.clients.graphql import create_signal
 from src.models.dataminr import DataminrSignal
+from src.services.geoparser import GeoparseResult, geoparse_signal
 from src.services.location import resolve_signal_location
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,27 @@ def extract_population_affected_from_text(*texts: str | None) -> int | None:
     return best
 
 
+def _geoparse_to_dict(result: GeoparseResult) -> dict:
+    """Shape a GeoparseResult for storage in signals.geoparsed_data.
+
+    Matches the JSONB shape documented on the Prisma model. We deliberately
+    drop the raw Nominatim payload — callers comparing against source coords
+    only need the resolved fields, and keeping the raw payload bloats the row.
+    """
+    return {
+        "candidate": result.candidate,
+        "kind": result.kind,
+        "field": result.field,
+        "lat": result.lat,
+        "lng": result.lng,
+        "country_code": result.country_code,
+        "osm_class": result.osm_class,
+        "osm_type": result.osm_type,
+        "importance": result.importance,
+        "display_name": result.display_name,
+    }
+
+
 def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
     """Map a Dataminr signal to a CLEAR CreateSignalInput dict."""
     # Build description from subHeadline fields
@@ -167,6 +189,24 @@ def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
     casualties = extract_casualties_from_text(signal.headline, description)
     if casualties is not None:
         input_data["casualties"] = casualties
+
+    # Text-based geoparser: additive enrichment, never blocks ingestion.
+    # Stored verbatim on signals.geoparsed_data for later comparison against
+    # the source's own coords. Any failure (no candidate, Nominatim down,
+    # circuit open) just means no enrichment for this signal.
+    try:
+        geo_result = geoparse_signal(signal.headline, description)
+        if geo_result is not None:
+            input_data["geoparsedData"] = _geoparse_to_dict(geo_result)
+            logger.info(
+                "Geoparsed signal: candidate=%r kind=%s field=%s importance=%.2f",
+                geo_result.candidate,
+                geo_result.kind,
+                geo_result.field,
+                geo_result.importance,
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort, swallow everything
+        logger.warning("Geoparser failed (continuing without enrichment): %s", exc)
 
     # Check if Dataminr provides coordinates
     has_coords = False

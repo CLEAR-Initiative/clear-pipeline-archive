@@ -1,0 +1,410 @@
+"""Signal geoparser — extract event location from title + description.
+
+The geoparser is **best-effort enrichment**, not a critical path. Every
+failure mode returns None and the caller falls back to source-supplied
+coordinates. Designed for ~100 signals/day with one outbound Nominatim
+call per signal (or zero, if the cache is warm).
+
+Pipeline:
+  1. Extract candidate place names from title and (optionally) body
+     using a small set of regex patterns. Title hits dominate body hits.
+  2. Filter out organisation / generic stopwords ("Sudanese Armed Forces",
+     "Reports", etc.) so we don't ship those to the geocoder.
+  3. Classify each candidate as **landmark** (ends with a known suffix
+     like "Airport", "Hospital") or **admin** (default).
+  4. Detect disqualifying context — candidates immediately preceded by
+     "transferred to", "fled toward", etc. get demoted.
+  5. Rank: landmarks beat admin; title beats body; earlier beats later;
+     disqualified candidates drop to the bottom.
+  6. Send the single top candidate to Nominatim. Pick the best result
+     (importance >= 0.3, within expected country codes).
+  7. Return a structured `GeoparseResult`, or None if anything failed.
+
+What this is NOT:
+  - A general-purpose NER system. No spaCy, no transformers, no ML.
+  - A noise-cleaning miracle. Garbage in, garbage out — but at least
+    "garbage" returns None rather than misattributing a signal.
+  - A precision-recovery engine. If both text and coords are at district
+    granularity, no algorithm here makes that any finer.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Literal
+
+from src.clients import nominatim
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Stopwords ────────────────────────────────────────────────────────────
+# Phrases that the extraction regexes will pick up but that aren't actually
+# place names — we drop them before they ever reach the geocoder.
+
+# Organisations + actors that appear capitalised in alert text.
+ORG_STOPWORDS: frozenset[str] = frozenset(
+    s.lower() for s in [
+        "Sudan", "Sudanese",  # nationality adjectives, not the country signal
+        "Armed Forces", "Sudanese Armed Forces", "SAF",
+        "Rapid Support Forces", "RSF",
+        "SPLM-N", "SPLA", "JEM", "SLA",
+        "United Nations", "UN", "UNAMID", "UNHCR", "UNICEF", "WFP",
+        "OCHA", "ICRC", "MSF", "Doctors Without Borders",
+        "Red Cross", "Red Crescent",
+        "World Food Programme", "World Health Organisation", "World Health Organization", "WHO",
+        "International Organization for Migration", "IOM",
+        "African Union", "AU", "European Union", "EU",
+        "International Criminal Court", "ICC",
+    ]
+)
+
+# Generic words that look like place names but aren't.
+GENERIC_STOPWORDS: frozenset[str] = frozenset(
+    s.lower() for s in [
+        "Reports", "Sources", "According", "Source", "Reuters",
+        "Twitter", "Facebook", "Telegram", "Instagram", "YouTube", "X",
+        "BBC", "CNN", "Al Jazeera", "AFP", "AP",
+        "Major News Outlet", "Local News Outlet", "News Outlet",
+        "Government", "Ministry", "Council",
+        "Sovereign Council", "Sovereignty Council",
+        "President", "Prime Minister", "General", "Lieutenant", "Major", "Colonel",
+        "North", "South", "East", "West",  # cardinal-only is too ambiguous
+        "Northern", "Southern", "Eastern", "Western",
+    ]
+)
+
+STOPWORDS: frozenset[str] = ORG_STOPWORDS | GENERIC_STOPWORDS
+
+
+# ─── Landmark suffixes ────────────────────────────────────────────────────
+# A candidate ending with any of these is classified as a landmark and
+# wins precedence over admin-unit candidates. Compared case-insensitively
+# with a leading-whitespace boundary so "Airport" matches "Nyala Airport"
+# but not "Airportside" or "Khairport".
+
+LANDMARK_SUFFIXES: frozenset[str] = frozenset(
+    s.lower() for s in [
+        "Airport", "Airfield", "Aerodrome", "Heliport",
+        "Hospital", "Clinic", "Medical Centre", "Health Centre",
+        "Bridge", "Crossing", "Border Crossing",
+        "School", "University", "College", "Institute",
+        "Market", "Souq", "Bazaar",
+        "Mosque", "Church", "Cathedral", "Synagogue", "Temple",
+        "Camp", "IDP Camp", "Refugee Camp",
+        "Stadium", "Arena", "Sports Complex",
+        "Refinery", "Power Station", "Power Plant", "Substation",
+        "Port", "Harbour", "Harbor", "Dock", "Wharf",
+        "Station", "Bus Station", "Railway Station", "Train Station",
+        "Barracks", "Compound", "Base", "Headquarters", "HQ",
+        "Prison", "Detention Centre",
+        "Palace", "Embassy", "Consulate",
+        "Dam", "Reservoir", "Lake",
+        "Bank",
+    ]
+)
+
+
+# ─── Disqualifying phrases ────────────────────────────────────────────────
+# When a candidate is immediately preceded by one of these phrases (within
+# ~3 words), it's flagged as incidental — typically a destination or
+# departure point, not the event location.
+# Matched case-insensitively against the text immediately before the
+# candidate's start position.
+
+DISQUALIFYING_PHRASES: frozenset[str] = frozenset(
+    s.lower() for s in [
+        "transferred to", "evacuated to", "fled toward", "fled to",
+        "headed to", "headed toward", "en route to", "bound for",
+        "destined for", "originating in", "originating from",
+        "moved to", "relocated to", "transported to",
+        "via",
+        "from",
+        "reports from", "according to sources in", "filed from",
+        "broadcast from", "reported from",
+    ]
+)
+
+
+# ─── Extraction patterns ──────────────────────────────────────────────────
+# A small set of regex patterns designed to be conservative — better to
+# miss a candidate than to ship a candidate that's a person's name or an
+# organisation. The patterns each emit (name, position) pairs.
+
+# Place names appearing after location-indicating prepositions:
+#   "explosion in Al Fasher, Sudan"  →  "Al Fasher"
+#   "near Markib"                    →  "Markib"
+_PREP_PATTERN = re.compile(
+    r"\b(in|at|near|around|outside)\s+"
+    r"((?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4})",
+)
+
+# Comma-separated hierarchical patterns:
+#   "Al Fasher, North Darfur, Sudan"  →  emits "Al Fasher" (deepest part)
+# Multi-segment splits handled later by re-running the matcher recursively.
+_COMMA_PATTERN = re.compile(
+    r"\b((?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4}),\s+"
+    r"(?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4},?",
+)
+
+
+@dataclass
+class Candidate:
+    """One extracted place-name candidate from a signal's text."""
+    name: str
+    field: Literal["title", "body"]
+    position: int                        # char index inside the field
+    kind: Literal["landmark", "admin"] = "admin"
+    disqualified: bool = False
+    extraction_reason: str = ""          # debug hint: 'after_in', 'comma_split', etc.
+    score: float = 0.0
+
+
+@dataclass
+class GeoparseResult:
+    """Final output of the geoparser when resolution succeeds."""
+    candidate: str
+    kind: Literal["landmark", "admin"]
+    field: Literal["title", "body"]
+    lat: float
+    lng: float
+    country_code: str | None
+    osm_class: str | None                # e.g. 'place', 'aeroway', 'amenity'
+    osm_type: str | None                 # e.g. 'city', 'aerodrome', 'hospital'
+    importance: float                    # Nominatim's importance score
+    display_name: str                    # full address-style label from Nominatim
+    raw: dict = field(default_factory=dict)  # the raw Nominatim result for callers that want more
+
+
+# ─── Extraction ───────────────────────────────────────────────────────────
+
+
+def _is_stopword(name: str) -> bool:
+    """True if the candidate is in either stopword list."""
+    return name.lower().strip() in STOPWORDS
+
+
+def _extract_from_text(text: str, field: Literal["title", "body"]) -> list[Candidate]:
+    """Run both extraction patterns over `text` and return surviving candidates.
+
+    Stopwords are filtered here so they never enter the ranking stage.
+    Duplicates (same lowercase name in same field) are deduplicated, keeping
+    the earliest position.
+    """
+    if not text:
+        return []
+
+    raw: list[Candidate] = []
+
+    # Pass 1: post-preposition candidates
+    for match in _PREP_PATTERN.finditer(text):
+        prep = match.group(1).lower()
+        name = match.group(2).strip().rstrip(".,;:!?")
+        if _is_stopword(name):
+            continue
+        raw.append(Candidate(
+            name=name,
+            field=field,
+            position=match.start(2),
+            extraction_reason=f"after_{prep}",
+        ))
+
+    # Pass 2: comma-separated hierarchical patterns — take the leading part
+    for match in _COMMA_PATTERN.finditer(text):
+        name = match.group(1).strip().rstrip(".,;:!?")
+        if _is_stopword(name):
+            continue
+        raw.append(Candidate(
+            name=name,
+            field=field,
+            position=match.start(1),
+            extraction_reason="comma_lead",
+        ))
+
+    # Deduplicate by lowercased name within the same field — keep earliest position
+    by_key: dict[str, Candidate] = {}
+    for c in raw:
+        key = c.name.lower()
+        if key not in by_key or c.position < by_key[key].position:
+            by_key[key] = c
+    return list(by_key.values())
+
+
+# ─── Classification ───────────────────────────────────────────────────────
+
+
+def _is_landmark(name: str) -> bool:
+    """True iff the candidate ends with a known landmark suffix."""
+    lower = name.lower()
+    for suffix in LANDMARK_SUFFIXES:
+        if lower.endswith(" " + suffix) or lower == suffix:
+            return True
+    return False
+
+
+def _is_disqualified(candidate: Candidate, text: str) -> bool:
+    """True iff the text immediately before the candidate matches a
+    disqualifying phrase. Checks up to 30 chars back from the candidate's
+    start position — enough to catch "transferred to" but not so much that
+    distant mentions interfere.
+    """
+    if candidate.position == 0:
+        return False
+    look_back = max(0, candidate.position - 30)
+    preceding = text[look_back:candidate.position].lower().rstrip()
+    for phrase in DISQUALIFYING_PHRASES:
+        # Tolerate trailing punctuation/whitespace before the candidate.
+        if preceding.endswith(phrase):
+            return True
+    return False
+
+
+# ─── Ranking ──────────────────────────────────────────────────────────────
+
+
+def _score(c: Candidate) -> float:
+    """Multi-factor score:
+       - title hits weighted 3× over body hits
+       - earlier positions weighted higher via 1/(pos+1)
+       - landmark candidates get a 2× bonus over admin
+       - disqualified candidates get a heavy 0.1× penalty
+    """
+    pos_score = 1.0 / (c.position + 1)
+    field_bonus = 3.0 if c.field == "title" else 1.0
+    kind_bonus = 2.0 if c.kind == "landmark" else 1.0
+    disqual_penalty = 0.1 if c.disqualified else 1.0
+    return pos_score * field_bonus * kind_bonus * disqual_penalty
+
+
+def _rank(candidates: list[Candidate]) -> list[Candidate]:
+    for c in candidates:
+        c.score = _score(c)
+    return sorted(candidates, key=lambda c: c.score, reverse=True)
+
+
+# ─── Nominatim result selection ───────────────────────────────────────────
+
+
+# Importance floor — below this, treat the result as too speculative to use.
+# LocationIQ / Nominatim returns 0-1; well-known places typically score >0.5,
+# obscure settlements 0.3-0.5, ambiguous matches drop below that.
+_MIN_IMPORTANCE = 0.3
+
+
+def _pick_best_nominatim_result(
+    results: list[dict],
+    expected_country_codes: set[str],
+) -> dict | None:
+    """Pick the highest-importance Nominatim result whose country is in
+    `expected_country_codes`. Returns None if nothing clears the floor."""
+    if not results:
+        return None
+
+    best: dict | None = None
+    best_importance = 0.0
+    for r in results:
+        try:
+            importance = float(r.get("importance", 0))
+        except (TypeError, ValueError):
+            continue
+        if importance < _MIN_IMPORTANCE:
+            continue
+        country = _extract_country_code(r)
+        if expected_country_codes and country and country not in expected_country_codes:
+            continue
+        if importance > best_importance:
+            best_importance = importance
+            best = r
+    return best
+
+
+def _extract_country_code(nominatim_result: dict) -> str | None:
+    """Pull the ISO country code from a Nominatim result if present."""
+    addr = nominatim_result.get("address") or {}
+    code = addr.get("country_code")
+    return code.lower() if isinstance(code, str) else None
+
+
+# ─── Public entry point ───────────────────────────────────────────────────
+
+
+def geoparse_signal(
+    title: str | None,
+    description: str | None = None,
+    *,
+    expected_country_codes: set[str] | None = None,
+) -> GeoparseResult | None:
+    """Parse a signal's title + description into a single resolved location.
+
+    Returns None for any failure path:
+      - empty inputs
+      - no extractable candidates (all stopwords / regex didn't match)
+      - top candidate has no Nominatim result above the importance floor
+      - Nominatim is unhealthy (circuit open) or unreachable
+
+    The caller is expected to handle None as "no geoparser enrichment" and
+    fall back to whatever coord-based resolution it does today.
+    """
+    expected = expected_country_codes or {"sd"}
+
+    candidates: list[Candidate] = []
+    candidates.extend(_extract_from_text(title or "", "title"))
+    candidates.extend(_extract_from_text(description or "", "body"))
+
+    if not candidates:
+        logger.debug("[geoparser] no candidates extracted")
+        return None
+
+    # Classify + disqualify
+    for c in candidates:
+        c.kind = "landmark" if _is_landmark(c.name) else "admin"
+        source_text = title if c.field == "title" else (description or "")
+        c.disqualified = _is_disqualified(c, source_text or "")
+
+    ranked = _rank(candidates)
+    top = ranked[0]
+    logger.debug(
+        "[geoparser] top candidate %r (kind=%s, field=%s, score=%.3f, "
+        "disqualified=%s, %d total candidates)",
+        top.name, top.kind, top.field, top.score, top.disqualified, len(ranked),
+    )
+
+    # Hard fail: if even the top candidate is disqualified, there's nothing to do
+    if top.disqualified:
+        logger.debug("[geoparser] top candidate is disqualified — bailing")
+        return None
+
+    # Resolve the top candidate via Nominatim
+    country_codes_param = ",".join(sorted(expected))
+    results = nominatim.search(top.name, country_codes=country_codes_param, limit=5)
+    if not results:
+        logger.debug("[geoparser] nominatim returned no usable result for %r", top.name)
+        return None
+
+    best = _pick_best_nominatim_result(results, expected)
+    if not best:
+        logger.debug("[geoparser] no nominatim result cleared importance floor for %r", top.name)
+        return None
+
+    try:
+        lat = float(best["lat"])
+        lng = float(best["lon"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("[geoparser] nominatim result missing lat/lon: %r", best)
+        return None
+
+    return GeoparseResult(
+        candidate=top.name,
+        kind=top.kind,
+        field=top.field,
+        lat=lat,
+        lng=lng,
+        country_code=_extract_country_code(best),
+        osm_class=best.get("class"),
+        osm_type=best.get("type"),
+        importance=float(best.get("importance", 0)),
+        display_name=str(best.get("display_name") or ""),
+        raw=best,
+    )
