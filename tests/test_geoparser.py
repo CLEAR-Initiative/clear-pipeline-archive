@@ -218,9 +218,28 @@ class TestResultSelection:
         best = gp._pick_best_nominatim_result(results, {"sd"})
         assert best is results[1]
 
-    def test_filters_below_importance_floor(self):
-        results = [self._result(importance=0.1), self._result(importance=0.2)]
-        assert gp._pick_best_nominatim_result(results, {"sd"}) is None
+    def test_low_importance_results_still_accepted(self):
+        """LocationIQ scores for Sudan-region places routinely fall below 0.3
+        (e.g., 'El Obeid Teaching Hospital' at 0.0001). We deliberately do
+        not impose an importance floor — Nominatim already orders by
+        relevance, and dropping low-importance results means losing valid
+        matches in low-density OSM regions."""
+        weak = self._result(importance=0.0001)
+        assert gp._pick_best_nominatim_result([weak], {"sd"}) is weak
+
+    def test_rejects_linear_feature_classes(self):
+        """Highways/railways/waterways are linear, not point — promoting one
+        to an A4 attributes signals to an arbitrary point on a road."""
+        road = self._result(importance=0.6, **{"class": "highway"})
+        place = self._result(importance=0.1, **{"class": "place"})
+        # Even though the highway has higher importance, the place wins
+        # because the highway class is rejected outright.
+        assert gp._pick_best_nominatim_result([road, place], {"sd"}) is place
+
+    def test_returns_none_when_only_rejected_classes(self):
+        rail = self._result(importance=0.7, **{"class": "railway"})
+        water = self._result(importance=0.5, **{"class": "waterway"})
+        assert gp._pick_best_nominatim_result([rail, water], {"sd"}) is None
 
     def test_empty_input_returns_none(self):
         assert gp._pick_best_nominatim_result([], {"sd"}) is None
@@ -280,9 +299,22 @@ class TestGeoparseSignal:
         with patch.object(gp.nominatim, "search", return_value=None):
             assert gp.geoparse_signal("Armed clash in Al Fasher") is None
 
-    def test_returns_none_when_no_result_above_importance_floor(self):
-        weak = self._nominatim_hit(importance=0.1)
+    def test_low_importance_hits_now_resolve(self):
+        """A low-importance hit for a real Sudan place (e.g. a teaching
+        hospital at importance ~0.0001) should still resolve. This locks in
+        the removal of the old 0.3 importance floor — that floor was silently
+        dropping the bulk of valid matches in low-density OSM regions."""
+        weak = self._nominatim_hit(importance=0.0001, cls="amenity")
         with patch.object(gp.nominatim, "search", return_value=[weak]):
+            result = gp.geoparse_signal("Armed clash in Al Fasher")
+        assert result is not None
+        assert result.importance == pytest.approx(0.0001)
+
+    def test_returns_none_when_only_rejected_class_results(self):
+        """A signal that only resolves to a highway/railway/waterway should
+        produce no geoparser hit — those classes aren't point locations."""
+        road = self._nominatim_hit(importance=0.6, cls="highway", typ="primary")
+        with patch.object(gp.nominatim, "search", return_value=[road]):
             assert gp.geoparse_signal("Armed clash in Al Fasher") is None
 
     def test_returns_none_when_no_candidates_extracted(self):

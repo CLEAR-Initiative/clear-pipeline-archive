@@ -52,6 +52,28 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 # (event_grouping_v2, notify) use. Connection is lazy.
 _redis = redis.from_url(settings.redis_url, decode_responses=True)
 
+# Track whether we've already warned about the missing API key in this
+# process. We log on first attempted call (not at import time) so the
+# warning lives next to whichever signal first tried to geocode — much
+# easier to correlate than a one-shot startup log.
+_warned_no_api_key = False
+
+
+def _warn_missing_api_key_once() -> None:
+    """Emit a single WARNING per worker process when LOCATIONIQ_API_KEY is
+    missing. Pre-fix this failure mode was completely silent — every call
+    returned None and no log line appeared, making it look like the
+    geoparser was misbehaving when the actual issue was config."""
+    global _warned_no_api_key
+    if _warned_no_api_key:
+        return
+    _warned_no_api_key = True
+    logger.warning(
+        "[nominatim] LOCATIONIQ_API_KEY is not set — geocoder is DISABLED. "
+        "Every geoparser lookup will return None and fall back to source "
+        "coords. Set the env var on the worker process to enable geocoding."
+    )
+
 
 def _normalize_query(query: str) -> str:
     """Normalisation must be identical on every call site so the cache key
@@ -208,6 +230,7 @@ def search(
         return None
     if not settings.locationiq_api_key:
         # Geocoder disabled by config. Equivalent to a permanent circuit-open.
+        _warn_missing_api_key_once()
         return None
 
     normalised = _normalize_query(query)

@@ -317,29 +317,42 @@ def _rank(candidates: list[Candidate]) -> list[Candidate]:
 # ─── Nominatim result selection ───────────────────────────────────────────
 
 
-# Importance floor — below this, treat the result as too speculative to use.
-# LocationIQ / Nominatim returns 0-1; well-known places typically score >0.5,
-# obscure settlements 0.3-0.5, ambiguous matches drop below that.
-_MIN_IMPORTANCE = 0.3
+# Classes Nominatim returns that are NOT valid point locations for an L4.
+# These are linear or zoned features rather than discrete places — promoting
+# them to an A4 point would attribute signals to an arbitrary point on a road
+# or a stretch of river. Everything else (place, boundary, amenity, aeroway,
+# building, leisure, tourism, landuse, natural, man_made, historic, ...)
+# passes through.
+_REJECTED_CLASSES: frozenset[str] = frozenset({"highway", "railway", "waterway"})
 
 
 def _pick_best_nominatim_result(
     results: list[dict],
     expected_country_codes: set[str],
 ) -> dict | None:
-    """Pick the highest-importance Nominatim result whose country is in
-    `expected_country_codes`. Returns None if nothing clears the floor."""
+    """Pick the highest-importance Nominatim result for a candidate, after
+    filtering for country and class.
+
+    No importance floor: LocationIQ / Nominatim importance scores for places
+    outside the OSM-dense Anglosphere can be vanishingly small (e.g., 0.0001
+    for "El Obeid Teaching Hospital", a real and well-known facility).
+    Filtering on importance silently dropped the bulk of valid Sudan matches
+    even though they were already cached. Nominatim returns results in
+    relevance order, so picking the highest-importance after class+country
+    filtering is sufficient on its own.
+    """
     if not results:
         return None
 
     best: dict | None = None
-    best_importance = 0.0
+    best_importance = -1.0  # accept 0-importance hits (real places in low-density OSM regions)
     for r in results:
         try:
             importance = float(r.get("importance", 0))
         except (TypeError, ValueError):
             continue
-        if importance < _MIN_IMPORTANCE:
+        cls = r.get("class")
+        if isinstance(cls, str) and cls.lower() in _REJECTED_CLASSES:
             continue
         country = _extract_country_code(r)
         if expected_country_codes and country and country not in expected_country_codes:
@@ -384,7 +397,7 @@ def geoparse_signal(
     candidates.extend(_extract_from_text(description or "", "body"))
 
     if not candidates:
-        logger.debug("[geoparser] no candidates extracted")
+        logger.info("[geoparser] no candidates extracted from text")
         return None
 
     # Classify + disqualify
@@ -395,7 +408,7 @@ def geoparse_signal(
 
     ranked = _rank(candidates)
     top = ranked[0]
-    logger.debug(
+    logger.info(
         "[geoparser] top candidate %r (kind=%s, field=%s, score=%.3f, "
         "disqualified=%s, %d total candidates)",
         top.name, top.kind, top.field, top.score, top.disqualified, len(ranked),
@@ -403,19 +416,23 @@ def geoparse_signal(
 
     # Hard fail: if even the top candidate is disqualified, there's nothing to do
     if top.disqualified:
-        logger.debug("[geoparser] top candidate is disqualified — bailing")
+        logger.info("[geoparser] top candidate %r is disqualified — bailing", top.name)
         return None
 
     # Resolve the top candidate via Nominatim
     country_codes_param = ",".join(sorted(expected))
     results = nominatim.search(top.name, country_codes=country_codes_param, limit=5)
     if not results:
-        logger.debug("[geoparser] nominatim returned no usable result for %r", top.name)
+        logger.info("[geoparser] nominatim returned no usable result for %r", top.name)
         return None
 
     best = _pick_best_nominatim_result(results, expected)
     if not best:
-        logger.debug("[geoparser] no nominatim result cleared importance floor for %r", top.name)
+        logger.info(
+            "[geoparser] no nominatim result cleared class/country filter for %r "
+            "(rejected classes: %s)",
+            top.name, sorted(_REJECTED_CLASSES),
+        )
         return None
 
     try:

@@ -194,6 +194,11 @@ def enrich_with_geoparser(
         return None
 
     if geo_result is None:
+        # No usable candidate. The geoparser itself logs the specific reason
+        # (no candidates extracted / disqualified / Nominatim empty / below
+        # importance floor) at INFO — look for the adjacent `[geoparser] ...`
+        # line in the log to see which gate fired.
+        logger.info("[%s] Geoparser produced no result — falling back to source coords", log_tag)
         return None
 
     input_data["geoparsedData"] = geoparse_to_dict(geo_result)
