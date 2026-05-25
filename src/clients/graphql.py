@@ -41,6 +41,14 @@ mutation UpdateSignalSeverity($id: String!, $severity: Int!) {
 }
 """
 
+UPDATE_SIGNAL_GEOPARSED_DATA = """
+mutation UpdateSignalGeoparsedData($id: String!, $geoparsedData: JSON!) {
+  updateSignalGeoparsedData(id: $id, geoparsedData: $geoparsedData) {
+    id
+  }
+}
+"""
+
 CREATE_EVENT = """
 mutation CreateEvent($input: CreateEventInput!) {
   createEvent(input: $input) {
@@ -397,6 +405,17 @@ def update_signal_severity(signal_id: str, severity: int) -> dict:
     return result["updateSignalSeverity"]
 
 
+def update_signal_geoparsed_data(signal_id: str, geoparsed_data: dict) -> dict:
+    """Attach the geoparser's structured result to an existing signal.
+    Used by the manual-signal pipeline path, where the signal is created
+    before the geoparser has run."""
+    result = _execute(
+        UPDATE_SIGNAL_GEOPARSED_DATA,
+        {"id": signal_id, "geoparsedData": geoparsed_data},
+    )
+    return result["updateSignalGeoparsedData"]
+
+
 def create_event(input_data: dict) -> dict:
     result = _execute(CREATE_EVENT, {"input": input_data})
     return result["createEvent"]
@@ -666,3 +685,50 @@ def upsert_nominatim_cache(
         },
     )
     return result["upsertNominatimCache"]
+
+
+# ─── Geoparser L4 promotion ────────────────────────────────────────────────
+
+FIND_OR_CREATE_LANDMARK_L4 = """
+mutation FindOrCreateLandmarkL4($input: FindOrCreateLandmarkL4Input!) {
+  findOrCreateLandmarkL4(input: $input) {
+    locationId
+    reused
+    pointType
+    abortedReason
+  }
+}
+"""
+
+
+def find_or_create_landmark_l4(
+    *,
+    name: str,
+    lat: float,
+    lng: float,
+    kind: str,
+    source_lat: float | None = None,
+    source_lng: float | None = None,
+) -> dict:
+    """Promote a geoparsed candidate into a reusable L4 location.
+
+    Returns the resolver result:
+      { locationId: str|None, reused: bool, pointType: str|None,
+        abortedReason: "different_a2"|None }
+
+    When abortedReason is set, the caller should fall back to source coords
+    (no L4 promotion) — the candidate's A2 didn't match the source's A2 and
+    promoting would mis-attribute the signal.
+    """
+    payload: dict = {
+        "name": name,
+        "lat": lat,
+        "lng": lng,
+        "kind": kind,
+    }
+    if source_lat is not None:
+        payload["sourceLat"] = source_lat
+    if source_lng is not None:
+        payload["sourceLng"] = source_lng
+    result = _execute(FIND_OR_CREATE_LANDMARK_L4, {"input": payload})
+    return result["findOrCreateLandmarkL4"]

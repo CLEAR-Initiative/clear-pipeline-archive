@@ -73,6 +73,10 @@ GENERIC_STOPWORDS: frozenset[str] = frozenset(
         "President", "Prime Minister", "General", "Lieutenant", "Major", "Colonel",
         "North", "South", "East", "West",  # cardinal-only is too ambiguous
         "Northern", "Southern", "Eastern", "Western",
+        # Days + months — these get picked up after "on" ("on Monday", "on May 19").
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
     ]
 )
 
@@ -136,8 +140,12 @@ DISQUALIFYING_PHRASES: frozenset[str] = frozenset(
 # Place names appearing after location-indicating prepositions:
 #   "explosion in Al Fasher, Sudan"  →  "Al Fasher"
 #   "near Markib"                    →  "Markib"
+#   "drone strike on Nyala Airport"  →  "Nyala Airport"
+# "on" is included because attack-style headlines and liveBrief text routinely
+# use "strike/attack ON <place>". Days-of-week + months are filtered as
+# stopwords above so "on Monday" / "on May 19" don't produce candidates.
 _PREP_PATTERN = re.compile(
-    r"\b(in|at|near|around|outside)\s+"
+    r"\b(in|at|near|around|outside|on)\s+"
     r"((?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4})",
 )
 
@@ -265,23 +273,45 @@ def _is_disqualified(candidate: Candidate, text: str) -> bool:
 
 
 def _score(c: Candidate) -> float:
-    """Multi-factor score:
+    """Multi-factor score, used WITHIN a ranking tier (see `_rank`):
        - title hits weighted 3× over body hits
        - earlier positions weighted higher via 1/(pos+1)
        - landmark candidates get a 2× bonus over admin
-       - disqualified candidates get a heavy 0.1× penalty
+
+    Disqualification is handled outside the score so disqualified candidates
+    drop below all clean ones regardless of how high they'd otherwise rank.
     """
     pos_score = 1.0 / (c.position + 1)
     field_bonus = 3.0 if c.field == "title" else 1.0
     kind_bonus = 2.0 if c.kind == "landmark" else 1.0
-    disqual_penalty = 0.1 if c.disqualified else 1.0
-    return pos_score * field_bonus * kind_bonus * disqual_penalty
+    return pos_score * field_bonus * kind_bonus
 
 
 def _rank(candidates: list[Candidate]) -> list[Candidate]:
+    """Three-tier ranking so the design intent "landmark beats admin" holds
+    even when admin appears in the title and landmark only in the body
+    (the common case for Dataminr — headline says "in Nyala", liveBrief
+    says "on Nyala Airport"):
+
+      Tier 0: clean landmarks
+      Tier 1: clean admins
+      Tier 2: anything disqualified
+
+    Inside each tier, `_score` orders by title-vs-body, position, and kind.
+    """
     for c in candidates:
         c.score = _score(c)
-    return sorted(candidates, key=lambda c: c.score, reverse=True)
+
+    def tier_key(c: Candidate) -> tuple[int, float]:
+        if c.disqualified:
+            tier = 2
+        elif c.kind == "landmark":
+            tier = 0
+        else:
+            tier = 1
+        return (tier, -c.score)
+
+    return sorted(candidates, key=tier_key)
 
 
 # ─── Nominatim result selection ───────────────────────────────────────────

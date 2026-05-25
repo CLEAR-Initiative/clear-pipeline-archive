@@ -12,6 +12,7 @@ from src.clients.graphql import (
     escalate_event,
     get_dataminr_source_id,
     get_disaster_types,
+    update_signal_geoparsed_data,
     update_signal_severity,
 )
 from src.config import settings
@@ -25,7 +26,8 @@ from src.prompts.classify import (
 from src.services.alert import is_stale_signal, maybe_escalate
 from src.services.event import dispatch_group_signal
 from src.services.local_classify import classify_locally
-from src.services.signal import ingest_signal
+from src.services.geoparser import geoparse_signal
+from src.services.signal import geoparse_to_dict, ingest_signal
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +319,24 @@ def process_manual_signal(
             classification.disaster_types,
             classification.severity,
         )
+
+        # ─── Geoparser enrichment ─────────────────────────────────────────────
+        # Manual signals are created in clear-api before the pipeline runs, so
+        # the geoparser fires here as post-hoc enrichment. We only attach the
+        # structured result to signals.geoparsed_data — locationId stays as
+        # the user picked it (manual-signal flows trust the human-entered
+        # location). Best-effort: any failure logs and continues.
+        logger.info("[manual:%s] Running geoparser", signal_id)
+        try:
+            geo_result = geoparse_signal(title, description)
+            if geo_result is not None:
+                update_signal_geoparsed_data(signal_id, geoparse_to_dict(geo_result))
+                logger.info(
+                    "[manual:%s] Geoparsed: candidate=%r kind=%s importance=%.2f",
+                    signal_id, geo_result.candidate, geo_result.kind, geo_result.importance,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("[manual:%s] Geoparser enrichment failed: %s", signal_id, exc)
 
         # Update severity. v1: Claude's classifier value is a valid fallback.
         # v2: only write if the caller provided a source severity — otherwise

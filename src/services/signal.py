@@ -3,7 +3,7 @@
 import logging
 import re
 
-from src.clients.graphql import create_signal
+from src.clients.graphql import create_signal, find_or_create_landmark_l4
 from src.models.dataminr import DataminrSignal
 from src.services.geoparser import GeoparseResult, geoparse_signal
 from src.services.location import resolve_signal_location
@@ -126,7 +126,7 @@ def extract_population_affected_from_text(*texts: str | None) -> int | None:
     return best
 
 
-def _geoparse_to_dict(result: GeoparseResult) -> dict:
+def geoparse_to_dict(result: GeoparseResult) -> dict:
     """Shape a GeoparseResult for storage in signals.geoparsed_data.
 
     Matches the JSONB shape documented on the Prisma model. We deliberately
@@ -145,6 +145,121 @@ def _geoparse_to_dict(result: GeoparseResult) -> dict:
         "importance": result.importance,
         "display_name": result.display_name,
     }
+
+
+def enrich_with_geoparser(
+    input_data: dict,
+    *,
+    title: str | None,
+    description: str | None,
+    extra_body_text: str | None = None,
+    promote: bool = True,
+    log_tag: str = "signal",
+) -> GeoparseResult | None:
+    """Run the geoparser on title+description and mutate `input_data`.
+
+    Shared between Dataminr/ACLED/GDACS pre-create flows. On success the
+    function sets:
+      - `geoparsedData`: structured dict shaped for the JSONB column
+      - `locationId` (only when `promote=True` and the L4 promotion clears
+        the same-A2 safety check) — passing this skips clear-api's default
+        "signal-title L4" branch in createPointLocation
+
+    `extra_body_text` lets the caller feed additional text to the geoparser
+    *without* changing the signal row's stored description. Dataminr uses it
+    to pass liveBrief + intelAgents content — places like "Nyala Airport"
+    that live in those sub-fields but never make it into the user-visible
+    description.
+
+    Best-effort. Any failure (no candidate, Nominatim down, circuit open,
+    L4 promotion error) is swallowed; the caller continues with source coords.
+
+    Source coords for the same-A2 check are read from
+    `input_data["lat"]`/`input_data["lng"]`, so callers must set those
+    before invoking this helper.
+
+    Returns the GeoparseResult (or None) so callers that need the candidate
+    name for logging don't have to re-parse the dict.
+    """
+    logger.info("[%s] Running geoparser", log_tag)
+    geoparser_body = description
+    if extra_body_text:
+        geoparser_body = (
+            f"{description}\n{extra_body_text}" if description else extra_body_text
+        )
+    try:
+        geo_result = geoparse_signal(title, geoparser_body)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("[%s] Geoparser failed (continuing without enrichment): %s", log_tag, exc)
+        return None
+
+    if geo_result is None:
+        return None
+
+    input_data["geoparsedData"] = geoparse_to_dict(geo_result)
+    logger.info(
+        "[%s] Geoparsed: candidate=%r kind=%s field=%s importance=%.2f",
+        log_tag, geo_result.candidate, geo_result.kind, geo_result.field, geo_result.importance,
+    )
+
+    if not promote:
+        return geo_result
+
+    try:
+        promo = find_or_create_landmark_l4(
+            name=geo_result.candidate,
+            lat=geo_result.lat,
+            lng=geo_result.lng,
+            kind=geo_result.kind,
+            source_lat=input_data.get("lat"),
+            source_lng=input_data.get("lng"),
+        )
+        if promo.get("abortedReason"):
+            logger.info(
+                "[%s] L4 promotion aborted (%s) — keeping source coords",
+                log_tag, promo["abortedReason"],
+            )
+        elif promo.get("locationId"):
+            input_data["locationId"] = promo["locationId"]
+            logger.info(
+                "[%s] Promoted to L4 %s (reused=%s, point_type=%s)",
+                log_tag, promo["locationId"], promo.get("reused"), promo.get("pointType"),
+            )
+    except Exception as exc:  # noqa: BLE001 — promotion is best-effort
+        logger.warning("[%s] L4 promotion failed: %s", log_tag, exc)
+
+    return geo_result
+
+
+def _build_dataminr_geoparser_text(signal: DataminrSignal) -> str | None:
+    """Collect every prose chunk from a Dataminr alert that might mention a
+    place name — liveBrief summaries and intelAgents content. The headline is
+    passed separately as the title; this function returns body-style text.
+
+    We feed this to the geoparser INSTEAD OF leaving it to the structured
+    description field. Dataminr typically leaves `subHeadline` null, so without
+    this the geoparser only ever sees the headline (where a precise landmark
+    like "Nyala Airport" rarely appears — the headline says "in Nyala").
+
+    Returns None when there's no extractable body text.
+    """
+    parts: list[str] = []
+    if signal.liveBrief:
+        for brief in signal.liveBrief:
+            if brief.summary:
+                parts.append(brief.summary)
+    if signal.intelAgents:
+        for agent in signal.intelAgents:
+            if not agent.summary:
+                continue
+            for section in agent.summary:
+                if section.content:
+                    for chunk in section.content:
+                        if chunk:
+                            parts.append(chunk)
+    if not parts:
+        return None
+    return "\n".join(parts)
 
 
 def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
@@ -190,25 +305,9 @@ def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
     if casualties is not None:
         input_data["casualties"] = casualties
 
-    # Text-based geoparser: additive enrichment, never blocks ingestion.
-    # Stored verbatim on signals.geoparsed_data for later comparison against
-    # the source's own coords. Any failure (no candidate, Nominatim down,
-    # circuit open) just means no enrichment for this signal.
-    try:
-        geo_result = geoparse_signal(signal.headline, description)
-        if geo_result is not None:
-            input_data["geoparsedData"] = _geoparse_to_dict(geo_result)
-            logger.info(
-                "Geoparsed signal: candidate=%r kind=%s field=%s importance=%.2f",
-                geo_result.candidate,
-                geo_result.kind,
-                geo_result.field,
-                geo_result.importance,
-            )
-    except Exception as exc:  # noqa: BLE001 — best-effort, swallow everything
-        logger.warning("Geoparser failed (continuing without enrichment): %s", exc)
-
-    # Check if Dataminr provides coordinates
+    # Check if Dataminr provides coordinates. We do this BEFORE the geoparser
+    # so the L4-promotion step can run a same-A2 safety check between the
+    # candidate's location and the source's coords.
     has_coords = False
     dataminr_location_name = None
     if signal.estimatedEventLocation:
@@ -220,10 +319,29 @@ def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
                 input_data["lng"] = coords[1]
                 has_coords = True
 
-    if has_coords:
-        # Dataminr has coordinates — let the API's PostGIS geo-resolution handle it.
-        # Skip the Claude displacement check: origin/destination aren't used downstream
-        # yet, so the LLM call is wasted credits.
+    # Text-based geoparser: additive enrichment + opportunistic L4 promotion.
+    # Source coords stay on `rawData` (full Dataminr dump above), so the
+    # original is always recoverable.
+    # `extra_body_text` feeds liveBrief + intelAgents content into the
+    # geoparser — Dataminr typically leaves subHeadline null, so without this
+    # the geoparser only sees the headline and misses landmarks like
+    # "Nyala Airport" that appear in the deeper structured fields.
+    enrich_with_geoparser(
+        input_data,
+        title=signal.headline,
+        description=description,
+        extra_body_text=_build_dataminr_geoparser_text(signal),
+        log_tag=f"dataminr:{signal.alertId}",
+    )
+
+    if input_data.get("locationId"):
+        # Geoparser promoted the signal to a precise L4 — clear-api will use
+        # that locationId verbatim and skip its own createPointLocation path.
+        logger.info("Signal location resolved via geoparser: %s", input_data["locationId"])
+    elif has_coords:
+        # Source coords only — let the API's PostGIS geo-resolution handle it.
+        # Skip the Claude displacement check: origin/destination aren't used
+        # downstream yet, so the LLM call is wasted credits.
         logger.info("Signal has coords: using lat/lng for PostGIS resolution")
     else:
         # No coordinates — use Claude to resolve location from text
