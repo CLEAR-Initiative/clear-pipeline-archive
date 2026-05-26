@@ -5,10 +5,15 @@ Runs after a crisis is created or an event is added to it. Populates:
   - populationInArea (sum of admin-level-2 populations for the event districts)
   - title + summary (Claude-generated narrative from the linked events)
 
+The `summary` field stored on the crisis is the JSON-serialised form of
+`{description, tldr}` — see `CrisisNarrative` for the schema. The column on
+the database stays a plain string; consumers JSON.parse it.
+
 Both outputs are written back in a single updateCrisisPopulation mutation
 so the crisis record is always consistent.
 """
 
+import json
 import logging
 
 from src.celery_app import app
@@ -116,7 +121,13 @@ def _compute_population_in_area(district_ids: list[str]) -> int | None:
 
 
 def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
-    """Generate (title, summary) for a crisis via Claude."""
+    """Generate (title, summary) for a crisis via Claude.
+
+    Returns:
+      - title: short headline
+      - summary: JSON-serialised `{description, tldr}` — the database column
+        stays a string; UI consumers JSON.parse on read.
+    """
     if not events:
         return None
 
@@ -140,7 +151,11 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
             prompt_version=CRISIS_PROMPT_VERSION,
         )
         narrative = CrisisNarrative.model_validate(result_data)
-        return narrative.title, narrative.summary
+        summary_json = json.dumps(
+            {"description": narrative.description, "tldr": narrative.tldr},
+            ensure_ascii=False,
+        )
+        return narrative.title, summary_json
     except Exception as e:
         logger.error("[CRISIS] Narrative generation failed: %s", e, exc_info=True)
         return None

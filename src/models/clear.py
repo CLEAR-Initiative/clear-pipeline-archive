@@ -70,10 +70,16 @@ class AlertAssessment(BaseModel):
 
 
 class CrisisNarrative(BaseModel):
-    """Output from Claude crisis narrative generation."""
+    """Output from Claude crisis narrative generation.
+
+    `summary` on the crisis row is the JSON-serialised form of
+    `{description, tldr}` so frontends can render the prose and the bullet
+    list independently without re-deriving one from the other.
+    """
 
     title: str
-    summary: str
+    description: str
+    tldr: list[str]
 
 
 class EventRewrite(BaseModel):
