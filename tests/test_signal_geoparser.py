@@ -137,19 +137,25 @@ class TestBug1FeederFix:
             in body
         )
 
-    def test_stored_description_unchanged_by_extra_body_text(self):
-        """The extra body text fed to the geoparser must NOT leak into the
-        signal row's stored description — that field stays subHeadline-only
-        (None for this payload)."""
+    def test_stored_description_falls_back_to_livebrief(self):
+        """Modern Dataminr alerts leave `subHeadline` null and put the prose
+        in `liveBrief[*].summary`. The stored description must fall back to
+        that prose so signal rows aren't shipped with description=null.
+
+        This is a fix on top of the geoparser feeder — earlier behavior left
+        the stored description null whenever subHeadline was null."""
         signal = DataminrSignal.model_validate(SAMPLE_PAYLOAD)
 
         with patch("src.services.signal.geoparse_signal", return_value=None), \
              patch("src.services.signal.find_or_create_landmark_l4"):
             input_data = build_signal_input(signal, source_id="src_test")
 
-        # subHeadline is null → stored description stays None. The richer
-        # text only goes to the geoparser, never to the DB column.
-        assert input_data["description"] is None
+        # The full liveBrief summary should now be the stored description.
+        assert input_data["description"] is not None
+        assert "Nyala Airport" in input_data["description"]
+        assert input_data["description"].startswith(
+            SAMPLE_PAYLOAD["liveBrief"][0]["summary"][:40]
+        )
 
     def test_end_to_end_resolves_to_nyala_airport_landmark(self):
         """End-to-end with the geoparser un-mocked; only Nominatim mocked.
@@ -226,3 +232,111 @@ class TestBug2RegexFix:
         )
         names = {c.name for c in candidates}
         assert "May" not in names
+
+
+# ─── Description fallback ─────────────────────────────────────────────────
+
+
+class TestDescriptionFallback:
+    """The stored description on a Dataminr signal row has two possible
+    sources, in priority order:
+
+      1. `subHeadline.title` + `subHeadline.subHeadlines` — populated on
+         older API responses.
+      2. `liveBrief[*].summary` joined — populated on modern responses,
+         which leave `subHeadline` null.
+
+    Before the fix, only (1) was checked, so modern alerts arrived with
+    `description: null` even though the prose was sitting in `liveBrief`.
+    """
+
+    @staticmethod
+    def _signal(**overrides: object) -> DataminrSignal:
+        """Minimal DataminrSignal builder. Includes estimatedEventLocation
+        with coords so build_signal_input takes the `has_coords` branch and
+        skips the Claude-backed location resolver — keeps the test hermetic.
+        Overrides any field via kwargs.
+        """
+        payload: dict = {
+            "alertId": "test-alert-id",
+            "alertTimestamp": "2026-05-26T00:00:00Z",
+            "headline": "Test headline",
+            "estimatedEventLocation": {
+                "name": "Test City",
+                "coordinates": [12.0, 30.0],
+            },
+        }
+        payload.update(overrides)
+        return DataminrSignal.model_validate(payload)
+
+    @staticmethod
+    def _build(signal: DataminrSignal) -> dict:
+        """Run build_signal_input with the geoparser stubbed off — we're
+        only testing the description-building branch here."""
+        with patch("src.services.signal.geoparse_signal", return_value=None), \
+             patch("src.services.signal.find_or_create_landmark_l4"):
+            return build_signal_input(signal, source_id="src_test")
+
+    def test_uses_subheadline_when_present(self):
+        """Older API path: subHeadline structured fields populate description."""
+        signal = self._signal(
+            subHeadline={"title": "Sub title", "subHeadlines": "Sub line"},
+        )
+        result = self._build(signal)
+        assert result["description"] is not None
+        assert "Sub title" in result["description"]
+        assert "Sub line" in result["description"]
+
+    def test_falls_back_to_livebrief_when_subheadline_null(self):
+        """Modern API path: subHeadline is null, so the description uses
+        liveBrief's summary."""
+        signal = self._signal(
+            subHeadline=None,
+            liveBrief=[{"summary": "Drone strike on Nyala Airport reported."}],
+        )
+        result = self._build(signal)
+        assert result["description"] == "Drone strike on Nyala Airport reported."
+
+    def test_joins_multiple_livebrief_summaries(self):
+        """liveBrief can be a list; all non-empty summaries are joined."""
+        signal = self._signal(
+            subHeadline=None,
+            liveBrief=[
+                {"summary": "First brief about the strike."},
+                {"summary": "Second brief with updated details."},
+            ],
+        )
+        result = self._build(signal)
+        assert result["description"] is not None
+        assert "First brief" in result["description"]
+        assert "Second brief" in result["description"]
+
+    def test_none_when_both_subheadline_and_livebrief_absent(self):
+        """No prose anywhere → description stays None."""
+        signal = self._signal(subHeadline=None, liveBrief=None)
+        result = self._build(signal)
+        assert result["description"] is None
+
+    def test_subheadline_takes_precedence_over_livebrief(self):
+        """When both are present, the structured subHeadline wins. The
+        fallback only fires when subHeadline yields nothing."""
+        signal = self._signal(
+            subHeadline={"title": "From subHeadline", "subHeadlines": None},
+            liveBrief=[{"summary": "From liveBrief — should be ignored."}],
+        )
+        result = self._build(signal)
+        assert result["description"] == "From subHeadline"
+        assert "liveBrief" not in (result["description"] or "")
+
+    def test_empty_livebrief_summary_is_skipped(self):
+        """A liveBrief entry with summary=None must not contribute an empty
+        chunk to the joined description."""
+        signal = self._signal(
+            subHeadline=None,
+            liveBrief=[
+                {"summary": None},
+                {"summary": "Only this one is real."},
+            ],
+        )
+        result = self._build(signal)
+        assert result["description"] == "Only this one is real."

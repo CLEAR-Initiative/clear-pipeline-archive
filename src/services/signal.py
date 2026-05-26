@@ -269,13 +269,20 @@ def _build_dataminr_geoparser_text(signal: DataminrSignal) -> str | None:
 
 def build_signal_input(signal: DataminrSignal, source_id: str) -> dict:
     """Map a Dataminr signal to a CLEAR CreateSignalInput dict."""
-    # Build description from subHeadline fields
-    description_parts = []
+    # Build description with two fallbacks. Modern Dataminr alerts leave
+    # `subHeadline` null and put the prose in `liveBrief[*].summary`; older
+    # alerts populated subHeadline. We try subHeadline first (cheap structured
+    # fields), then fall back to joining liveBrief summaries.
+    description_parts: list[str] = []
     if signal.subHeadline:
         if signal.subHeadline.title:
             description_parts.append(signal.subHeadline.title)
         if signal.subHeadline.subHeadlines:
             description_parts.append(signal.subHeadline.subHeadlines)
+    if not description_parts and signal.liveBrief:
+        for brief in signal.liveBrief:
+            if brief.summary:
+                description_parts.append(brief.summary)
     description = " — ".join(description_parts) if description_parts else None
 
     # URL from publicPost
