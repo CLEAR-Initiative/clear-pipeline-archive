@@ -258,18 +258,25 @@ def enrich_crisis(
         summary: str | None = None
         scenarios: dict | None = None
         clarification: str | None = None
-        if generate_narrative and event_ids:
-            # Fetch full event details once; all three Claude calls reuse them.
+        if event_ids:
+            # Fetch full event details once; all Claude calls reuse them.
             events: list[dict] = []
             for eid in event_ids:
                 e = graphql.get_event_for_crisis(eid)
                 if e:
                     events.append(e)
 
-            result = _generate_narrative(events)
-            if result:
-                title, summary = result
-                logger.info("[CRISIS] Narrative: title=%r", title)
+            # `generate_narrative` only gates title/summary regeneration —
+            # those are user-overridable fields and we shouldn't clobber what
+            # a human wrote on createCrisisFromEvents. Scenarios and
+            # clarification are net-new structured fields with no
+            # user-provided counterpart, so they always regenerate when the
+            # event set changes (create / add / remove).
+            if generate_narrative:
+                result = _generate_narrative(events)
+                if result:
+                    title, summary = result
+                    logger.info("[CRISIS] Narrative: title=%r", title)
 
             scenarios = _generate_scenarios(events)
             if scenarios:
