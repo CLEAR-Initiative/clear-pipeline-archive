@@ -27,12 +27,89 @@ def _estimate_severity_from_dataminr(signal: DataminrSignal) -> int | None:
     return None
 
 
+# ─── Casualty extraction ─────────────────────────────────────────────────
+#
 # Match common phrasings of fatality counts in news/alert text:
 #   "12 killed", "at least 5 dead", "3 fatalities", "killed 8 people",
-#   "death toll of 14", "leaving 6 dead". We deliberately stay narrow on
-#   the verb list to avoid false positives ("injured", "displaced" are
-#   tracked separately and don't belong here).
-_NUM = r"(\d{1,5})"
+#   "death toll of 14", "leaving 6 dead". Also handles written-out
+#   numbers: "fourteen killed", "twenty-three dead", "one hundred killed".
+#
+# We deliberately stay narrow on the verb list to avoid false positives
+# ("injured", "displaced" are tracked separately and don't belong here).
+
+# Word→int building blocks. Covers 0-999 with hyphenated or space-separated
+# compounds ("twenty-one", "twenty one", "one hundred and fifty"). Beyond
+# ~99 written-out is uncommon, but "one hundred" / "two hundred" do appear.
+_ONES: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+_TEENS: dict[str, int] = {
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS_MULTIPLES: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_SCALES: dict[str, int] = {"hundred": 100, "thousand": 1000}
+_NUMBER_WORDS: dict[str, int] = {**_ONES, **_TEENS, **_TENS_MULTIPLES, **_SCALES}
+
+# Regex alternation of every supported number word. Longest-first to keep
+# the engine from picking "ten" out of "tenth"-prefixed greedy matches.
+_NUMBER_WORD_TOKEN_RE = "|".join(
+    re.escape(w) for w in sorted(_NUMBER_WORDS.keys(), key=len, reverse=True)
+)
+# A "phrase" is one or more number-word tokens joined by space/hyphen,
+# optionally with "and" between groups ("two hundred and fifty"). The whole
+# phrase is one captured group from the caller's perspective.
+_NUM_WORD_PHRASE = (
+    rf"(?:{_NUMBER_WORD_TOKEN_RE})"
+    rf"(?:[-\s]+(?:and[-\s]+)?(?:{_NUMBER_WORD_TOKEN_RE}))*"
+)
+# Combined capture: either a digit run or a number-word phrase.
+_NUM = rf"(\d{{1,5}}|{_NUM_WORD_PHRASE})"
+
+
+def _parse_number_phrase(raw: str) -> int | None:
+    """Parse a captured number — digits or English words — into an int.
+
+    Returns None for inputs we can't interpret (unknown tokens, empty
+    string, etc.) so the caller can skip the match.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Digit form: cheap path.
+    if raw.isdigit():
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    # Word form: split on whitespace/hyphen, drop fillers ("and"), sum up.
+    tokens = [
+        t for t in raw.lower().replace("-", " ").split()
+        if t and t != "and"
+    ]
+    if not tokens:
+        return None
+    total = 0
+    current = 0
+    for tok in tokens:
+        if tok not in _NUMBER_WORDS:
+            return None  # unknown token — refuse to guess
+        value = _NUMBER_WORDS[tok]
+        if value == 100:
+            current = (current or 1) * 100
+        elif value == 1000:
+            current = (current or 1) * 1000
+            total += current
+            current = 0
+        else:
+            current += value
+    return total + current
+
+
 _CASUALTY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(rf"\b(?:at least|over|more than|nearly|around|about)?\s*{_NUM}\s+(?:people\s+)?(?:were\s+|are\s+)?(?:killed|dead|deceased|fatalities)\b", re.IGNORECASE),
     re.compile(rf"\b(?:killed|leaving|left)\s+(?:at least\s+|over\s+|more than\s+|nearly\s+)?{_NUM}\s+(?:people|dead|civilians|soldiers)?\b", re.IGNORECASE),
@@ -43,6 +120,9 @@ _CASUALTY_PATTERNS: list[re.Pattern[str]] = [
 
 def extract_casualties_from_text(*texts: str | None) -> int | None:
     """Best-effort fatality count parsed from free-text headlines/descriptions.
+
+    Accepts both digit forms ("12 killed") and English number words
+    ("fourteen killed", "twenty-three dead", "one hundred killed").
 
     Returns the maximum number found across all matched patterns (multiple
     sources sometimes mention different running totals; the upper bound is
@@ -55,9 +135,8 @@ def extract_casualties_from_text(*texts: str | None) -> int | None:
             continue
         for pat in _CASUALTY_PATTERNS:
             for m in pat.finditer(text):
-                try:
-                    val = int(m.group(1))
-                except (ValueError, IndexError):
+                val = _parse_number_phrase(m.group(1))
+                if val is None:
                     continue
                 if val < 0 or val > 100_000:
                     continue

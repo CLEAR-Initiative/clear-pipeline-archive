@@ -44,6 +44,7 @@ from src.services.classifier_singleton import (
     level2_to_codes_map,
 )
 from src.services.event_type_stats import get_stats_for_event_type
+from src.services.signal import extract_casualties_from_text
 from src.services.redis_lock import redis_lock
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,29 @@ def _compute_event_severity(
         mean = sum(severities) / len(severities)
         return max(1, min(5, round(mean)))
     return claude_fallback
+
+
+def _resolve_actual_casualties(
+    created_signal: dict[str, Any] | None,
+    signal_title: str | None,
+    signal_description: str | None,
+) -> int | None:
+    """Pick the best 'actual' casualty count for a signal:
+
+      1. The structured value the source/builder set (signal.casualties on
+         the GraphQL result — e.g. ACLED's `fatalities`, or Dataminr's
+         build-time regex extraction).
+      2. Regex extraction from title + description as a backstop for sources
+         whose builders don't run the extraction (GDACS, manual signals).
+
+    Returns None when neither yields a number — the caller is expected to
+    fall through to the per-event-type historical lookup.
+    """
+    if created_signal:
+        source_value = created_signal.get("casualties")
+        if source_value is not None:
+            return source_value
+    return extract_casualties_from_text(signal_title, signal_description)
 
 
 def _stats_for_glide(glide_code: str | None) -> dict:
@@ -392,11 +416,19 @@ def group_signal_v2(
             break
     location_name = primary.get("name") if primary else None
 
-    # If we don't have an admin2, there's nothing to race against — two
-    # isolated events for different unknown locations don't conflict.
-    # Resolve the per-signal stats once: prefer raw-extracted values when the
-    # source provided them, otherwise fall back to the per-event-type lookup.
-    actual_casualties = created_signal.get("casualties") if created_signal else None
+    # Resolve the per-signal stats once. Casualties priority:
+    #   1. Source-shipped structured field (signal.casualties — ACLED's
+    #      `fatalities`, or whatever the signal-builder already extracted).
+    #   2. Text-extraction from title + description (covers GDACS and
+    #      manual-signal paths whose builders don't run the regex).
+    #   3. Per-event-type historical lookup (q75 fatalities for the level_3
+    #      sub-type) via `_resolve_signal_stats` below.
+    # The text-extraction tier closes the gap where GDACS / manual signals
+    # used to skip straight to the historical default even when the title
+    # plainly said "23 killed".
+    actual_casualties = _resolve_actual_casualties(
+        created_signal, signal_title, signal_description,
+    )
     resolved_stats = _resolve_signal_stats(
         actual_casualties=actual_casualties,
         actual_population=signal_actual_population_affected,
