@@ -82,6 +82,32 @@ class CrisisNarrative(BaseModel):
     tldr: list[str]
 
 
+class CrisisScenarios(BaseModel):
+    """Output from Claude crisis-scenarios generation.
+
+    Stored verbatim on `crises.scenarios` (JSONB). Each field is a paragraph
+    of prose — `description` covers the scenario variables (political,
+    economic, environmental, etc.), the others are the forward trajectories.
+    """
+
+    most_likely: str
+    best_case: str
+    worst_case: str
+    description: str
+
+
+class CrisisNeedsClarification(BaseModel):
+    """Output from Claude needs-clarification generation (NRC SAF framework).
+
+    The LLM returns four bullet points (severity / drivers / response gaps /
+    priority action) joined into a single string, each prefixed with `-`.
+    Stored verbatim on `crises.needs.clarification` (merged into the existing
+    `needs` JSONB object without disturbing other keys).
+    """
+
+    clarification: str
+
+
 class EventRewrite(BaseModel):
     """Output from Claude event rewrite. Used by the new district+type grouping
     algorithm, where Claude no longer makes clustering decisions — only polishes

@@ -140,6 +140,14 @@ mutation UpdateCrisisPopulation($id: String!, $input: UpdateCrisisPopulationInpu
 }
 """
 
+UPDATE_CRISIS_NEEDS_CLARIFICATION = """
+mutation UpdateCrisisNeedsClarification($id: String!, $clarification: String!) {
+  updateCrisisNeedsClarification(id: $id, clarification: $clarification) {
+    id
+  }
+}
+"""
+
 GET_LOCATION_WITH_GEOMETRY = """
 query LocationWithGeometry($id: String!) {
   location(id: $id) {
@@ -174,9 +182,9 @@ query EventForCrisis($id: String!) {
     types
     severity
     populationAffected
-    originLocation { name }
-    destinationLocation { name }
-    generalLocation { name }
+    originLocation { name metadata { type data } }
+    destinationLocation { name metadata { type data } }
+    generalLocation { name metadata { type data } }
   }
 }
 """
@@ -551,12 +559,23 @@ def archive_stale_alerts(older_than_days: int = 14) -> int:
     return int(result["archiveStaleAlerts"]["alertsArchived"])
 
 
+def update_crisis_needs_clarification(crisis_id: str, clarification: str) -> dict:
+    """Merge an LLM-generated SAF clarification into the crisis's `needs`
+    JSONB. Server-side JSONB `||` merge preserves other keys on `needs`."""
+    result = _execute(
+        UPDATE_CRISIS_NEEDS_CLARIFICATION,
+        {"id": crisis_id, "clarification": clarification},
+    )
+    return result["updateCrisisNeedsClarification"]
+
+
 def update_crisis_population(
     crisis_id: str,
     population_affected: int | None = None,
     population_in_area: int | None = None,
     title: str | None = None,
     summary: str | None = None,
+    scenarios: dict | None = None,
 ) -> dict:
     input_data: dict = {}
     if population_affected is not None:
@@ -567,6 +586,8 @@ def update_crisis_population(
         input_data["title"] = title
     if summary is not None:
         input_data["summary"] = summary
+    if scenarios is not None:
+        input_data["scenarios"] = scenarios
     result = _execute(
         UPDATE_CRISIS_POPULATION,
         {"id": crisis_id, "input": input_data},

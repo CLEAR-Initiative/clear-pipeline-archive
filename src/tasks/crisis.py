@@ -19,11 +19,21 @@ import logging
 from src.celery_app import app
 from src.clients import graphql
 from src.clients.claude import ClaudeRateLimited, call_claude
-from src.models.clear import CrisisNarrative
+from src.models.clear import (
+    CrisisNarrative,
+    CrisisNeedsClarification,
+    CrisisScenarios,
+)
 from src.prompts.crisis import (
+    CLARIFICATION_PROMPT_VERSION,
+    CLARIFICATION_SYSTEM_PROMPT,
     CRISIS_PROMPT_VERSION,
+    SCENARIOS_PROMPT_VERSION,
+    SCENARIOS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    build_clarification_prompt,
     build_crisis_prompt,
+    build_scenarios_prompt,
 )
 from src.services.population import estimate_population_for_districts
 
@@ -120,6 +130,76 @@ def _compute_population_in_area(district_ids: list[str]) -> int | None:
     return total
 
 
+def _collect_location_names(events: list[dict]) -> list[str]:
+    """Distinct origin/destination/general location names across the events.
+    Order-stable so the prompt is reproducible across runs with the same input."""
+    locations: list[str] = []
+    seen: set[str] = set()
+    for e in events:
+        for key in ("originLocation", "destinationLocation", "generalLocation"):
+            loc = e.get(key)
+            if loc and loc.get("name") and loc["name"] not in seen:
+                locations.append(loc["name"])
+                seen.add(loc["name"])
+    return locations
+
+
+def _generate_needs_clarification(events: list[dict]) -> str | None:
+    """Generate an NRC SAF-framework clarification for a crisis via Claude.
+
+    Returns the clarification as a single string of four dash-prefixed
+    bullet points (Severity / Drivers / Response gaps / Priority action).
+    Stored under `crises.needs.clarification` (merged into the existing
+    `needs` JSONB by the GraphQL mutation, leaving other keys untouched).
+    Returns None on any failure — clarification is best-effort enrichment.
+    """
+    if not events:
+        return None
+
+    locations = _collect_location_names(events)
+    prompt = build_clarification_prompt(events, locations)
+
+    try:
+        result_data = call_claude(
+            CLARIFICATION_SYSTEM_PROMPT,
+            prompt,
+            stage="crisis-clarification",
+            prompt_version=CLARIFICATION_PROMPT_VERSION,
+        )
+        parsed = CrisisNeedsClarification.model_validate(result_data)
+        return parsed.clarification
+    except Exception as e:
+        logger.error("[CRISIS] Clarification generation failed: %s", e, exc_info=True)
+        return None
+
+
+def _generate_scenarios(events: list[dict]) -> dict | None:
+    """Generate forward-looking scenarios for a crisis via Claude.
+
+    Returns a dict with keys {most_likely, best_case, worst_case, description},
+    suitable for storing directly on `crises.scenarios` (JSONB). Returns None
+    on any failure — scenarios are best-effort enrichment.
+    """
+    if not events:
+        return None
+
+    locations = _collect_location_names(events)
+    prompt = build_scenarios_prompt(events, locations)
+
+    try:
+        result_data = call_claude(
+            SCENARIOS_SYSTEM_PROMPT,
+            prompt,
+            stage="crisis-scenarios",
+            prompt_version=SCENARIOS_PROMPT_VERSION,
+        )
+        scenarios = CrisisScenarios.model_validate(result_data)
+        return scenarios.model_dump()
+    except Exception as e:
+        logger.error("[CRISIS] Scenarios generation failed: %s", e, exc_info=True)
+        return None
+
+
 def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
     """Generate (title, summary) for a crisis via Claude.
 
@@ -131,16 +211,7 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
     if not events:
         return None
 
-    # Collect distinct location names from events
-    locations: list[str] = []
-    seen: set[str] = set()
-    for e in events:
-        for key in ("originLocation", "destinationLocation", "generalLocation"):
-            loc = e.get(key)
-            if loc and loc.get("name") and loc["name"] not in seen:
-                locations.append(loc["name"])
-                seen.add(loc["name"])
-
+    locations = _collect_location_names(events)
     prompt = build_crisis_prompt(events, locations)
 
     try:
@@ -185,8 +256,10 @@ def enrich_crisis(
 
         title: str | None = None
         summary: str | None = None
+        scenarios: dict | None = None
+        clarification: str | None = None
         if generate_narrative and event_ids:
-            # Fetch full event details
+            # Fetch full event details once; all three Claude calls reuse them.
             events: list[dict] = []
             for eid in event_ids:
                 e = graphql.get_event_for_crisis(eid)
@@ -198,19 +271,40 @@ def enrich_crisis(
                 title, summary = result
                 logger.info("[CRISIS] Narrative: title=%r", title)
 
-        # Single write-back for everything we have
+            scenarios = _generate_scenarios(events)
+            if scenarios:
+                logger.info(
+                    "[CRISIS] Scenarios generated (most_likely=%d chars)",
+                    len(scenarios.get("most_likely", "")),
+                )
+
+            clarification = _generate_needs_clarification(events)
+            if clarification:
+                logger.info(
+                    "[CRISIS] Clarification generated (%d chars)",
+                    len(clarification),
+                )
+
+        # Population + narrative + scenarios in one mutation; clarification
+        # merges into `needs` via a dedicated mutation so we don't clobber
+        # other keys already on the JSONB object.
         graphql.update_crisis_population(
             crisis_id,
             population_in_area=population_in_area,
             title=title,
             summary=summary,
+            scenarios=scenarios,
         )
+        if clarification:
+            graphql.update_crisis_needs_clarification(crisis_id, clarification)
 
         return {
             "crisis_id": crisis_id,
             "population_in_area": population_in_area,
             "title": title,
             "summary": summary,
+            "scenarios": scenarios,
+            "clarification": clarification,
         }
 
     except ClaudeRateLimited as exc:
