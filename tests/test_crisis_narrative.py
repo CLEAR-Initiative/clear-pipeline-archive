@@ -23,21 +23,23 @@ from unittest.mock import patch
 import pytest
 
 from src.models.clear import (
+    NEEDS_SECTORS,
     CrisisNarrative,
-    CrisisNeedsClarification,
+    CrisisNeedsAnalysis,
     CrisisScenarios,
 )
 from src.prompts.crisis import (
-    CLARIFICATION_USER_PROMPT_TEMPLATE,
+    NEEDS_ANALYSIS_SYSTEM_PROMPT,
+    NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE,
     SCENARIOS_USER_PROMPT_TEMPLATE,
     USER_PROMPT_TEMPLATE,
-    build_clarification_prompt,
     build_crisis_prompt,
+    build_needs_analysis_prompt,
     build_scenarios_prompt,
 )
 from src.tasks.crisis import (
     _generate_narrative,
-    _generate_needs_clarification,
+    _generate_needs_analysis,
     _generate_scenarios,
 )
 
@@ -326,29 +328,188 @@ class TestGenerateScenarios:
         assert kwargs.get("prompt_version") == "crisis-scenarios-v1"
 
 
-# ─── Needs clarification (NRC SAF) ─────────────────────────────────────────
+# ─── Needs analysis (NRC SAF) ──────────────────────────────────────────────
 
 
-class TestCrisisNeedsClarificationModel:
-    """Pydantic-level shape checks for the clarification payload that lands
-    inside `crises.needs.clarification`."""
+class TestCrisisNeedsAnalysisModel:
+    """Pydantic-level shape checks for the analysis payload that lands
+    under `crises.needs.{generalSummary, sector}`. The `sector` field is
+    keyed by canonical NRC sector names (NEEDS_SECTORS); unknown keys are
+    rejected so the LLM can't introduce hallucinated sector names."""
 
-    def test_accepts_clarification_string(self):
-        text = (
-            "- Severity — Severe overall, driven by food security and protection.\n"
-            "- Drivers — Displacement has severed access to markets.\n"
-            "- Response gaps — Education cluster absent in 3W.\n"
-            "- Priority action — RNA-first to verify school closures."
-        )
-        result = CrisisNeedsClarification.model_validate({"clarification": text})
-        assert result.clarification.startswith("- Severity")
+    _FULL_SECTOR_PAYLOAD = {
+        "generalSummary": "Severe overall — food security and protection drive "
+                          "the classification; confidence Medium given 8-month MSNA age.",
+        "sector": {
+            "Shelter": {
+                "description": "Severe — 40% of HHs report inadequate shelter.",
+                "severity": "Severe",
+                "responseGap": False,
+                "nrcRelevant": True,
+            },
+            "WASH": {
+                "description": "Stressed — water trucking covers most needs.",
+                "severity": "Stressed",
+                "responseGap": False,
+                "nrcRelevant": True,
+            },
+            "Protection": {
+                "description": "Extreme — civilian targeting reported.",
+                "severity": "Extreme",
+                "responseGap": True,
+                "nrcRelevant": False,
+            },
+            "Health": {
+                "description": "Severe — clinics damaged, supply chain disrupted.",
+                "severity": "Severe",
+                "responseGap": True,
+                "nrcRelevant": False,
+            },
+            "Food Security": {
+                "description": "Severe — 58% food insecure per MSNA.",
+                "severity": "Severe",
+                "responseGap": False,
+                "nrcRelevant": False,
+            },
+            "Education": {
+                "description": "Minimal — schools out of session; not driving the crisis.",
+                "severity": "Minimal",
+                "responseGap": True,
+                "nrcRelevant": True,
+            },
+        },
+    }
 
-    def test_rejects_missing_field(self):
+    def test_accepts_all_six_sectors(self):
+        result = CrisisNeedsAnalysis.model_validate(self._FULL_SECTOR_PAYLOAD)
+        assert result.generalSummary.startswith("Severe overall")
+        assert set(result.sector.keys()) == set(NEEDS_SECTORS)
+        assert result.sector["Food Security"].description.startswith("Severe")
+
+    def test_accepts_partial_sector_subset(self):
+        """LLM may legitimately produce only the sectors that matter for a
+        crisis — partial subsets of NEEDS_SECTORS are accepted."""
+        payload = {
+            "generalSummary": "...",
+            "sector": {
+                "Food Security": {
+                    "description": "Severe.", "severity": "Severe",
+                    "responseGap": False, "nrcRelevant": False,
+                },
+                "Protection": {
+                    "description": "Extreme.", "severity": "Extreme",
+                    "responseGap": True, "nrcRelevant": False,
+                },
+            },
+        }
+        result = CrisisNeedsAnalysis.model_validate(payload)
+        assert set(result.sector.keys()) == {"Food Security", "Protection"}
+
+    def test_rejects_unknown_sector_key(self):
+        """A sector name outside NEEDS_SECTORS is a hallucination — reject it."""
+        payload = {
+            "generalSummary": "...",
+            "sector": {
+                "Shelter": {
+                    "description": "...", "severity": "Severe",
+                    "responseGap": False, "nrcRelevant": True,
+                },
+                "Logistics": {
+                    "description": "Not a canonical NRC sector",
+                    "severity": "Minimal", "responseGap": False, "nrcRelevant": False,
+                },
+            },
+        }
         with pytest.raises(Exception):
-            CrisisNeedsClarification.model_validate({"other": "foo"})
+            CrisisNeedsAnalysis.model_validate(payload)
+
+    def test_sector_entry_accepts_extra_fields(self):
+        """Beyond the four required fields, sector entries accept additional
+        content (indicator percentages, cluster actors, recommendation) so
+        the schema can grow without a Pydantic change."""
+        payload = {
+            "generalSummary": "...",
+            "sector": {
+                "Food Security": {
+                    "description": "Severe — 58% food insecure.",
+                    "severity": "Severe",
+                    "responseGap": False,
+                    "nrcRelevant": True,
+                    "actors": ["WFP", "FAO"],
+                    "recommendation": "Stabilisation response",
+                },
+            },
+        }
+        result = CrisisNeedsAnalysis.model_validate(payload)
+        # Extras flow through via model_dump for downstream JSON storage.
+        dumped = result.model_dump()
+        assert dumped["sector"]["Food Security"]["actors"] == ["WFP", "FAO"]
+        assert dumped["sector"]["Food Security"]["recommendation"] == "Stabilisation response"
+
+    @pytest.mark.parametrize(
+        "missing_field",
+        ["description", "severity", "responseGap", "nrcRelevant"],
+    )
+    def test_rejects_sector_entry_missing_required_field(self, missing_field: str):
+        full = {
+            "description": "...",
+            "severity": "Severe",
+            "responseGap": False,
+            "nrcRelevant": True,
+        }
+        partial = {k: v for k, v in full.items() if k != missing_field}
+        payload = {"generalSummary": "...", "sector": {"Shelter": partial}}
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(payload)
+
+    @pytest.mark.parametrize(
+        "level",
+        ["Minimal", "Stressed", "Severe", "Extreme", "Catastrophic"],
+    )
+    def test_accepts_all_saf_severity_levels(self, level: str):
+        payload = {
+            "generalSummary": "...",
+            "sector": {
+                "Shelter": {
+                    "description": "...",
+                    "severity": level,
+                    "responseGap": False,
+                    "nrcRelevant": True,
+                },
+            },
+        }
+        result = CrisisNeedsAnalysis.model_validate(payload)
+        assert result.sector["Shelter"].severity == level
+
+    def test_rejects_invalid_severity_level(self):
+        """Casing/spelling matters — the Literal type is strict so the
+        prompt's exact strings are the only accepted values."""
+        payload = {
+            "generalSummary": "...",
+            "sector": {
+                "Shelter": {
+                    "description": "...",
+                    "severity": "severe",  # lower-case — rejected
+                    "responseGap": False,
+                    "nrcRelevant": True,
+                },
+            },
+        }
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(payload)
+
+        payload["sector"]["Shelter"]["severity"] = "Critical"  # not a SAF level
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(payload)
+
+    @pytest.mark.parametrize("missing", ["generalSummary", "sector"])
+    def test_rejects_missing_top_level_field(self, missing: str):
+        bad = {k: v for k, v in self._FULL_SECTOR_PAYLOAD.items() if k != missing}
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(bad)
 
 
-class TestClarificationPromptShape:
+class TestNeedsAnalysisPromptShape:
     """Pin the SAF prompt template so any drift away from the spec gets
     caught here rather than in production output."""
 
@@ -356,26 +517,54 @@ class TestClarificationPromptShape:
         for level in (
             "Minimal", "Stressed", "Severe", "Extreme", "Catastrophic",
         ):
-            assert level in CLARIFICATION_USER_PROMPT_TEMPLATE, (
-                f"SAF severity level {level!r} missing from clarification prompt"
+            assert level in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE, (
+                f"SAF severity level {level!r} missing from needs analysis prompt"
             )
 
-    def test_template_includes_four_bullet_labels(self):
-        for label in (
-            "Severity", "Drivers", "Response gaps", "Priority action",
-        ):
-            assert label in CLARIFICATION_USER_PROMPT_TEMPLATE
+    def test_template_asks_for_general_summary_and_sector(self):
+        """Both top-level output keys must appear in the JSON schema block."""
+        assert '"generalSummary"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+        assert '"sector"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+        assert '"description"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
 
-    def test_template_requests_dash_prefixed_bullets(self):
-        """The spec explicitly says 'each starting with a dash (-)'."""
-        assert "starting with a dash" in CLARIFICATION_USER_PROMPT_TEMPLATE
+    def test_template_lists_all_six_sectors(self):
+        """The prompt must list every canonical sector verbatim so the LLM
+        produces matching JSON keys (and the validator accepts the result)."""
+        for sector in NEEDS_SECTORS:
+            assert sector in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE, (
+                f"Sector {sector!r} missing from needs analysis prompt"
+            )
+
+    def test_template_uses_sectors_as_json_keys(self):
+        """The JSON schema block in the prompt should use the exact sector
+        strings as object keys (with the quoted form) so the LLM gets the
+        casing/spelling right."""
+        for sector in NEEDS_SECTORS:
+            assert f'"{sector}"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+
+    def test_template_requests_all_per_sector_fields(self):
+        """Every required field on SectorAnalysis must be named in the
+        prompt — if the prompt drifts away from any of them the LLM
+        responses will start failing Pydantic validation."""
+        for field in ("description", "severity", "responseGap", "nrcRelevant"):
+            assert f'"{field}"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE, (
+                f"Per-sector field {field!r} missing from the prompt JSON schema"
+            )
+
+    def test_template_covers_saf_dimensions(self):
+        """The two SAF dimensions the analyst is asked to apply must both
+        be referenced in the prompt."""
+        assert "Dimension 6" in NEEDS_ANALYSIS_SYSTEM_PROMPT or "Dimension 6" in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+        assert "Dimension 7" in NEEDS_ANALYSIS_SYSTEM_PROMPT or "Dimension 7" in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
 
     def test_template_flags_data_age_consideration(self):
         """The SAF prompt must remind the model that the MSNA data is
         8 months old so confidence is downgraded when warranted."""
-        assert "8 months" in CLARIFICATION_USER_PROMPT_TEMPLATE
+        assert "8 months" in (
+            NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE + NEEDS_ANALYSIS_SYSTEM_PROMPT
+        )
 
-    def test_build_clarification_prompt_embeds_events_and_locality_data(self):
+    def test_build_needs_analysis_prompt_embeds_events_and_locality_data(self):
         events = [
             {
                 "title": "Flood in El Fasher", "description": "Northern flooded.",
@@ -389,7 +578,7 @@ class TestClarificationPromptShape:
                 },
             },
         ]
-        prompt = build_clarification_prompt(events, ["North Darfur"])
+        prompt = build_needs_analysis_prompt(events, ["North Darfur"])
         assert "Flood in El Fasher" in prompt
         assert "North Darfur" in prompt
         # Locality metadata flows into the prompt verbatim so the LLM can
@@ -398,7 +587,7 @@ class TestClarificationPromptShape:
         assert "OCHA-3W" in prompt
         assert "food_insecure_pct" in prompt
 
-    def test_build_clarification_prompt_flags_missing_metadata(self):
+    def test_build_needs_analysis_prompt_flags_missing_metadata(self):
         """When no location metadata is available, the prompt block must
         say so explicitly so the model downgrades confidence instead of
         hallucinating indicator values."""
@@ -409,13 +598,13 @@ class TestClarificationPromptShape:
                 "generalLocation": {"name": "Unknown District"},
             },
         ]
-        prompt = build_clarification_prompt(events, ["Unknown District"])
+        prompt = build_needs_analysis_prompt(events, ["Unknown District"])
         assert "no MSNA" in prompt or "locality metadata available" in prompt
 
 
-class TestGenerateNeedsClarification:
-    """End-to-end through `_generate_needs_clarification` with Claude
-    mocked. Pins the return value (plain string) and the telemetry tags."""
+class TestGenerateNeedsAnalysis:
+    """End-to-end through `_generate_needs_analysis` with Claude mocked.
+    Pins the return dict shape and the telemetry tags."""
 
     _EVENT_FIXTURE = [
         {
@@ -434,43 +623,86 @@ class TestGenerateNeedsClarification:
     ]
 
     _CLAUDE_RESPONSE = {
-        "clarification": (
-            "- Severity — Severe overall, driven by food security and protection; "
-            "confidence Medium given 8-month MSNA age.\n"
-            "- Drivers — Displacement has severed access to markets, compounding "
-            "pre-existing food insecurity.\n"
-            "- Response gaps — Education cluster absent in 3W; NRC has core "
-            "competency.\n"
-            "- Priority action — Assessment-first (RNA) to verify school closure "
-            "type and current water quality."
+        "generalSummary": (
+            "Severe overall — food security and protection drive the "
+            "classification; confidence Medium given 8-month MSNA age. "
+            "Displacement has severed access to markets, compounding "
+            "pre-existing food insecurity. Evidence supports an "
+            "assessment-first (RNA) priority action."
         ),
+        "sector": {
+            "Shelter": {
+                "description": "Severe — 40% inadequate shelter.",
+                "severity": "Severe", "responseGap": False, "nrcRelevant": True,
+            },
+            "WASH": {
+                "description": "Stressed — water trucking covers most needs.",
+                "severity": "Stressed", "responseGap": False, "nrcRelevant": True,
+            },
+            "Protection": {
+                "description": "Extreme — civilian targeting reported.",
+                "severity": "Extreme", "responseGap": True, "nrcRelevant": False,
+            },
+            "Health": {
+                "description": "Severe — clinics damaged.",
+                "severity": "Severe", "responseGap": True, "nrcRelevant": False,
+            },
+            "Food Security": {
+                "description": "Severe — 58% food insecure per MSNA.",
+                "severity": "Severe", "responseGap": False, "nrcRelevant": False,
+            },
+            "Education": {
+                "description": "Stressed — schools functioning at reduced capacity.",
+                "severity": "Stressed", "responseGap": True, "nrcRelevant": True,
+            },
+        },
     }
 
-    def test_returns_clarification_string(self):
+    def test_returns_dict_with_general_summary_and_sector(self):
         with patch("src.tasks.crisis.call_claude", return_value=self._CLAUDE_RESPONSE):
-            result = _generate_needs_clarification(self._EVENT_FIXTURE)
+            result = _generate_needs_analysis(self._EVENT_FIXTURE)
 
-        assert isinstance(result, str)
-        assert result.startswith("- Severity")
-        assert result.count("\n- ") == 3  # four bullets total
+        assert result is not None
+        assert set(result.keys()) == {"generalSummary", "sector"}
+        assert result["generalSummary"].startswith("Severe overall")
+        # Per-sector breakdown contains all six canonical sectors and every
+        # required SectorAnalysis field on each entry.
+        assert set(result["sector"].keys()) == set(NEEDS_SECTORS)
+        for sector_name, entry in result["sector"].items():
+            assert {"description", "severity", "responseGap", "nrcRelevant"} <= set(entry.keys()), (
+                f"Sector {sector_name!r} missing required fields: got {sorted(entry.keys())}"
+            )
+        assert result["sector"]["Food Security"]["severity"] == "Severe"
+        assert result["sector"]["Protection"]["responseGap"] is True
+
+    def test_result_is_jsonable(self):
+        """The dict must be directly serialisable for the GraphQL JSON
+        scalar — no Pydantic objects leaking through."""
+        import json as _json
+        with patch("src.tasks.crisis.call_claude", return_value=self._CLAUDE_RESPONSE):
+            result = _generate_needs_analysis(self._EVENT_FIXTURE)
+        _json.dumps(result)
 
     def test_returns_none_on_validation_failure(self):
-        """Claude returning a malformed shape (missing `clarification`) →
-        None. Best-effort enrichment, no exception bubbles up."""
-        with patch("src.tasks.crisis.call_claude", return_value={"other": "x"}):
-            result = _generate_needs_clarification(self._EVENT_FIXTURE)
+        """Claude returning a malformed shape (missing one of the top-level
+        keys) → None. Best-effort enrichment, no exception bubbles up."""
+        with patch(
+            "src.tasks.crisis.call_claude",
+            return_value={"generalSummary": "..."},  # missing `sector`
+        ):
+            result = _generate_needs_analysis(self._EVENT_FIXTURE)
         assert result is None
 
     def test_returns_none_for_empty_event_list(self):
         with patch("src.tasks.crisis.call_claude") as mock_claude:
-            result = _generate_needs_clarification([])
+            result = _generate_needs_analysis([])
         assert result is None
         mock_claude.assert_not_called()
 
-    def test_uses_clarification_prompt_version(self):
+    def test_uses_needs_analysis_prompt_version(self):
         """Telemetry tag must distinguish this stage from narrative/scenarios."""
         with patch("src.tasks.crisis.call_claude", return_value=self._CLAUDE_RESPONSE) as mock_claude:
-            _generate_needs_clarification(self._EVENT_FIXTURE)
+            _generate_needs_analysis(self._EVENT_FIXTURE)
         _, kwargs = mock_claude.call_args
-        assert kwargs.get("stage") == "crisis-clarification"
-        assert kwargs.get("prompt_version") == "crisis-clarification-v1"
+        assert kwargs.get("stage") == "crisis-needs-analysis"
+        assert kwargs.get("prompt_version") == "crisis-needs-analysis-v1"

@@ -21,18 +21,18 @@ from src.clients import graphql
 from src.clients.claude import ClaudeRateLimited, call_claude
 from src.models.clear import (
     CrisisNarrative,
-    CrisisNeedsClarification,
+    CrisisNeedsAnalysis,
     CrisisScenarios,
 )
 from src.prompts.crisis import (
-    CLARIFICATION_PROMPT_VERSION,
-    CLARIFICATION_SYSTEM_PROMPT,
     CRISIS_PROMPT_VERSION,
+    NEEDS_ANALYSIS_PROMPT_VERSION,
+    NEEDS_ANALYSIS_SYSTEM_PROMPT,
     SCENARIOS_PROMPT_VERSION,
     SCENARIOS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
-    build_clarification_prompt,
     build_crisis_prompt,
+    build_needs_analysis_prompt,
     build_scenarios_prompt,
 )
 from src.services.population import estimate_population_for_districts
@@ -144,32 +144,30 @@ def _collect_location_names(events: list[dict]) -> list[str]:
     return locations
 
 
-def _generate_needs_clarification(events: list[dict]) -> str | None:
-    """Generate an NRC SAF-framework clarification for a crisis via Claude.
+def _generate_needs_analysis(events: list[dict]) -> dict | None:
+    """Generate an NRC SAF-framework needs analysis for a crisis via Claude.
 
-    Returns the clarification as a single string of four dash-prefixed
-    bullet points (Severity / Drivers / Response gaps / Priority action).
-    Stored under `crises.needs.clarification` (merged into the existing
-    `needs` JSONB by the GraphQL mutation, leaving other keys untouched).
-    Returns None on any failure — clarification is best-effort enrichment.
+    Returns a dict shaped as `{generalSummary, sector}`, suitable for a
+    JSONB merge into the existing `crises.needs` object. Returns None on
+    any failure — analysis is best-effort enrichment.
     """
     if not events:
         return None
 
     locations = _collect_location_names(events)
-    prompt = build_clarification_prompt(events, locations)
+    prompt = build_needs_analysis_prompt(events, locations)
 
     try:
         result_data = call_claude(
-            CLARIFICATION_SYSTEM_PROMPT,
+            NEEDS_ANALYSIS_SYSTEM_PROMPT,
             prompt,
-            stage="crisis-clarification",
-            prompt_version=CLARIFICATION_PROMPT_VERSION,
+            stage="crisis-needs-analysis",
+            prompt_version=NEEDS_ANALYSIS_PROMPT_VERSION,
         )
-        parsed = CrisisNeedsClarification.model_validate(result_data)
-        return parsed.clarification
+        parsed = CrisisNeedsAnalysis.model_validate(result_data)
+        return parsed.model_dump()
     except Exception as e:
-        logger.error("[CRISIS] Clarification generation failed: %s", e, exc_info=True)
+        logger.error("[CRISIS] Needs analysis generation failed: %s", e, exc_info=True)
         return None
 
 
@@ -257,7 +255,7 @@ def enrich_crisis(
         title: str | None = None
         summary: str | None = None
         scenarios: dict | None = None
-        clarification: str | None = None
+        needs_analysis: dict | None = None
         if event_ids:
             # Fetch full event details once; all Claude calls reuse them.
             events: list[dict] = []
@@ -285,14 +283,14 @@ def enrich_crisis(
                     len(scenarios.get("most_likely", "")),
                 )
 
-            clarification = _generate_needs_clarification(events)
-            if clarification:
+            needs_analysis = _generate_needs_analysis(events)
+            if needs_analysis:
                 logger.info(
-                    "[CRISIS] Clarification generated (%d chars)",
-                    len(clarification),
+                    "[CRISIS] Needs analysis generated (generalSummary=%d chars)",
+                    len(needs_analysis.get("generalSummary", "")),
                 )
 
-        # Population + narrative + scenarios in one mutation; clarification
+        # Population + narrative + scenarios in one mutation; needs analysis
         # merges into `needs` via a dedicated mutation so we don't clobber
         # other keys already on the JSONB object.
         graphql.update_crisis_population(
@@ -302,8 +300,12 @@ def enrich_crisis(
             summary=summary,
             scenarios=scenarios,
         )
-        if clarification:
-            graphql.update_crisis_needs_clarification(crisis_id, clarification)
+        if needs_analysis:
+            graphql.set_crisis_needs_analysis(
+                crisis_id,
+                general_summary=needs_analysis["generalSummary"],
+                sector=needs_analysis["sector"],
+            )
 
         return {
             "crisis_id": crisis_id,
@@ -311,7 +313,7 @@ def enrich_crisis(
             "title": title,
             "summary": summary,
             "scenarios": scenarios,
-            "clarification": clarification,
+            "needs_analysis": needs_analysis,
         }
 
     except ClaudeRateLimited as exc:

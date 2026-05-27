@@ -141,14 +141,14 @@ def build_scenarios_prompt(events: list[dict], locations: list[str]) -> str:
     )
 
 
-# ─── Needs clarification (NRC SAF) ────────────────────────────────────────
+# ─── Needs analysis (NRC SAF) ─────────────────────────────────────────────
 # The LLM applies the NRC Situation Analysis Framework (Dimensions 6 + 7)
-# to MSNA + OCHA 3W data and produces four labelled bullet points. Stored
-# inside the existing `crises.needs` JSONB under the `clarification` key.
+# to MSNA + OCHA 3W data and produces a structured needs analysis. Stored
+# under `crises.needs.{generalSummary, sector}` via a JSONB merge.
 
-CLARIFICATION_PROMPT_VERSION = "crisis-clarification-v1"
+NEEDS_ANALYSIS_PROMPT_VERSION = "crisis-needs-analysis-v1"
 
-CLARIFICATION_SYSTEM_PROMPT = """\
+NEEDS_ANALYSIS_SYSTEM_PROMPT = """\
 You are an emergency response analyst applying the NRC Situation Analysis Framework (SAF). You are given MSNA indicator data (household survey, 8 months old) and OCHA 3W partner presence data for a specific locality in Sudan. Your task is to produce a structured assessment for an Emergency Response Manager deciding whether to deploy a response, run a Rapid Needs Assessment, or monitor.
 
 Apply the SAF Humanitarian Conditions framework (Dimension 6) to assess sector severity, and the SAF Priority Needs framework (Dimension 7) to synthesise across sectors.
@@ -156,20 +156,47 @@ Apply the SAF Humanitarian Conditions framework (Dimension 6) to assess sector s
 You MUST respond with valid JSON only — no markdown, no explanation before or after."""
 
 
-CLARIFICATION_USER_PROMPT_TEMPLATE = """\
-Produce exactly 4 bullet points. Each bullet must be one sentence. Use these labels in order:
+NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE = """\
+Produce a structured needs analysis with two parts:
 
-- Severity — Classify overall humanitarian conditions using the SAF five-level scale (Minimal / Stressed / Severe / Extreme / Catastrophic). State which sectors drive the classification and your confidence level (High / Medium / Low) based on data age and completeness. If confidence is Low, say so explicitly.
-- Drivers — Identify 1–2 causal factors linking the crisis context to these conditions. Do not just restate the indicators. Explain why conditions are what they are (e.g. "displacement has severed access to markets, compounding food insecurity that pre-dates the conflict").
-- Response gaps — Identify sectors where conditions are Severe or above AND no cluster actor is present in 3W data. State clearly whether this represents an unmet need or whether 3W absence may reflect reporting lag. Note if NRC has a relevant core competency.
-- Priority action — Using SAF Dimension 7 criteria, state whether the evidence supports: immediate life-saving response, stabilisation response, assessment-first (RNA), or monitoring. Be explicit about what would change this recommendation (e.g. "RNA to verify school closure type and current water quality would shift this from assessment to response").
+1. `generalSummary` — A 2-3 sentence paragraph synthesising:
+   - Overall severity on the SAF five-level scale (Minimal / Stressed / Severe / Extreme / Catastrophic), with the sectors driving it and confidence level (High / Medium / Low).
+   - The 1-2 causal factors that explain *why* conditions are what they are (e.g. "displacement has severed access to markets, compounding food insecurity that pre-dates the conflict") — not just a restatement of the indicators.
+   - The priority action implied by SAF Dimension 7: immediate life-saving response, stabilisation response, assessment-first (RNA), or monitoring.
+
+2. `sector` — An object keyed by NRC sector. Produce one entry for each of
+   the six sectors below. Each entry has these required fields:
+   - `description` (string, 2-3 sentences) — prose covering severity, the
+     cluster gap picture, and any NRC-relevant context.
+   - `severity` (string) — exactly one of: "Minimal", "Stressed",
+     "Severe", "Extreme", "Catastrophic". Use the SAF Dimension 6 scale;
+     stick to this exact casing/spelling.
+   - `responseGap` (boolean) — `true` when no cluster actor is present in
+     3W data for this sector (an unmet need or reporting gap), `false`
+     when the cluster is covered. If 3W absence is more likely a
+     reporting lag than a true gap, still mark `true` but say so in the
+     `description`.
+   - `nrcRelevant` (boolean) — `true` when NRC has a relevant core
+     competency for this sector (Shelter, WASH, Education, ICLA, LFS),
+     `false` otherwise. Use this to flag where NRC could plausibly deploy.
+
+   If a sector is clearly Minimal or not applicable, still produce its
+   entry with `severity: "Minimal"` and explain in the description rather
+   than omitting it — this keeps the UI consistent across crises.
+
+   Canonical sector names (use these exact strings as JSON keys):
+   - Shelter
+   - WASH
+   - Protection
+   - Health
+   - Food Security
+   - Education
 
 Important:
 - Do not reference composite scores or numeric indices.
 - Use actual indicator percentages from the data when available.
 - Distinguish between what the data shows (observed) and what you are inferring (analytical judgment).
-- Flag if data age (8 months) materially limits your confidence in any dimension.
-- Return only 4 bullet points, each starting with a dash (-).
+- Flag in the confidence rating if data age (8 months) materially limits your confidence.
 
 Context — events ({event_count}):
 {events_block}
@@ -180,9 +207,50 @@ Locality data (MSNA indicators, OCHA 3W partner presence, other available
 location metadata; may be sparse — flag this in your confidence rating):
 {locality_data_block}
 
-Respond with this exact JSON structure:
+Respond with this exact JSON structure. Each sector entry MUST include all
+four fields (description, severity, responseGap, nrcRelevant) — the API
+rejects partial entries.
+
 {{
-  "clarification": "- Severity — ...\\n- Drivers — ...\\n- Response gaps — ...\\n- Priority action — ..."
+  "generalSummary": "<2-3 sentence synthesis of severity, drivers, and priority action>",
+  "sector": {{
+    "Shelter": {{
+      "description": "<2-3 sentences on shelter conditions, response gap, NRC fit>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }},
+    "WASH": {{
+      "description": "<2-3 sentences>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }},
+    "Protection": {{
+      "description": "<2-3 sentences>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }},
+    "Health": {{
+      "description": "<2-3 sentences>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }},
+    "Food Security": {{
+      "description": "<2-3 sentences>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }},
+    "Education": {{
+      "description": "<2-3 sentences>",
+      "severity": "<Minimal|Stressed|Severe|Extreme|Catastrophic>",
+      "responseGap": <true|false>,
+      "nrcRelevant": <true|false>
+    }}
+  }}
 }}
 """
 
@@ -215,11 +283,11 @@ def _format_locality_data_block(events: list[dict]) -> str:
     return "\n".join(chunks) if chunks else "(no MSNA / 3W / locality metadata available for these locations)"
 
 
-def build_clarification_prompt(events: list[dict], locations: list[str]) -> str:
-    """Render the user-prompt for the SAF clarification call. Pulls
+def build_needs_analysis_prompt(events: list[dict], locations: list[str]) -> str:
+    """Render the user-prompt for the SAF needs-analysis call. Pulls
     locality metadata off the events themselves — the caller is expected
     to have fetched events with their location.metadata."""
-    return CLARIFICATION_USER_PROMPT_TEMPLATE.format(
+    return NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE.format(
         event_count=len(events),
         events_block=_format_events_block(events),
         locations=", ".join(locations) if locations else "unknown",

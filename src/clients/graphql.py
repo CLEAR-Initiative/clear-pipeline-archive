@@ -140,9 +140,17 @@ mutation UpdateCrisisPopulation($id: String!, $input: UpdateCrisisPopulationInpu
 }
 """
 
-UPDATE_CRISIS_NEEDS_CLARIFICATION = """
-mutation UpdateCrisisNeedsClarification($id: String!, $clarification: String!) {
-  updateCrisisNeedsClarification(id: $id, clarification: $clarification) {
+SET_CRISIS_NEEDS_ANALYSIS = """
+mutation SetCrisisNeedsAnalysis(
+  $id: String!,
+  $generalSummary: String!,
+  $sector: JSON!,
+) {
+  setCrisisNeedsAnalysis(
+    id: $id,
+    generalSummary: $generalSummary,
+    sector: $sector,
+  ) {
     id
   }
 }
@@ -559,14 +567,24 @@ def archive_stale_alerts(older_than_days: int = 14) -> int:
     return int(result["archiveStaleAlerts"]["alertsArchived"])
 
 
-def update_crisis_needs_clarification(crisis_id: str, clarification: str) -> dict:
-    """Merge an LLM-generated SAF clarification into the crisis's `needs`
-    JSONB. Server-side JSONB `||` merge preserves other keys on `needs`."""
+def set_crisis_needs_analysis(
+    crisis_id: str,
+    *,
+    general_summary: str,
+    sector: dict,
+) -> dict:
+    """Merge an LLM-generated SAF needs analysis into the crisis's `needs`
+    JSONB. Server-side JSONB `||` merge overwrites `generalSummary` and
+    `sector` keys only — other keys on `needs` stay intact."""
     result = _execute(
-        UPDATE_CRISIS_NEEDS_CLARIFICATION,
-        {"id": crisis_id, "clarification": clarification},
+        SET_CRISIS_NEEDS_ANALYSIS,
+        {
+            "id": crisis_id,
+            "generalSummary": general_summary,
+            "sector": sector,
+        },
     )
-    return result["updateCrisisNeedsClarification"]
+    return result["setCrisisNeedsAnalysis"]
 
 
 def update_crisis_population(
