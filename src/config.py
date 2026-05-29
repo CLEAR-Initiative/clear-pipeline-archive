@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     # raw signal extraction (ACLED has none, GDACS exposure data,
     # Dataminr/manual regex) nor the per-event-type lookup (median pop_1km
     # via acled_event_type_stats.json) produces a value.
-    default_population_affected: int = 1715
+    default_population_affected: int = 33_000
 
     # IOM DTM API — displaced-person data per admin level
     iom_dtm_base_url: str = "https://dtmapi.iom.int/v3"

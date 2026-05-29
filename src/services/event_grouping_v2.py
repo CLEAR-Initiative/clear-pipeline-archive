@@ -59,8 +59,6 @@ ACTIVE_EVENTS_TTL_V2 = 300  # 5 min
 # getting grouped just because they share district+type.
 ACTIVE_EVENTS_WINDOW_DAYS = 7
 
-IOM_DTM_METADATA_TYPE = "iom_dtm_displacement"
-
 
 def _compute_event_severity(
     signals: list[dict],
@@ -191,38 +189,20 @@ def _merge_event_stats(target: dict, resolved: dict) -> dict:
     return out
 
 
-def _resolve_population_displaced(
-    claude_value: int | None,
-    admin2_id: str | None,
-) -> int | None:
-    """Three-tier fallback:
-      1. `claude_value` (Claude's max extraction across signal text).
-      2. `location_metadata(type="iom_dtm_displacement")` for the event's
-         admin-2, reading `data.population_displaced`.
-      3. `settings.default_population_displaced` (1670 by default).
-    Returns None only if all three fall through (shouldn't happen — default
-    is always set).
+def _resolve_population_displaced(claude_value: int | None) -> int:
+    """Two-tier fallback:
+      1. `claude_value` (regex-style extraction across the signal text done
+         by the rewrite pass).
+      2. `settings.default_population_displaced` (1670 by default).
+
+    The DTM-from-location-metadata tier was previously between these two,
+    but DTM data is district-wide and event-agnostic — we'd attribute a
+    whole-district displacement total to a single event, inflating the
+    estimate. Better to fall straight through to the bounded default when
+    the text doesn't tell us a number.
     """
     if claude_value is not None and claude_value > 0:
         return int(claude_value)
-
-    if admin2_id:
-        try:
-            rows = graphql.get_location_metadata(admin2_id, IOM_DTM_METADATA_TYPE)
-            if rows:
-                data = rows[0].get("data") or {}
-                dtm_val = data.get("population_displaced")
-                if dtm_val is not None:
-                    logger.info(
-                        "[GROUPING v2] populationDisplaced from DTM for admin2=%s: %s",
-                        admin2_id, dtm_val,
-                    )
-                    return int(dtm_val)
-        except Exception as e:
-            logger.warning(
-                "[GROUPING v2] DTM lookup failed for admin2=%s: %s",
-                admin2_id, e,
-            )
 
     default = settings.default_population_displaced
     logger.info("[GROUPING v2] populationDisplaced falling back to default: %s", default)
@@ -608,7 +588,6 @@ def _match_and_act(
     )
     pop_displaced = _resolve_population_displaced(
         claude_value=rewrite.population_displaced if rewrite else None,
-        admin2_id=admin2_id,
     )
 
     # casualties + populationAffected were already set at create_event() time
