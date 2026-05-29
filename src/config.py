@@ -138,6 +138,41 @@ class Settings(BaseSettings):
     # BA/FM overlap.
     iom_dtm_assessment_type: str = "BA,FM"
 
+    # ─── Nominatim geocoder (currently LocationIQ as the backend) ────────────
+    # The Nominatim-compatible geocoder client uses these. We talk to
+    # LocationIQ's free tier (5,000 req/day, 2 req/sec burst), but the code
+    # is named for the protocol so we can switch to MapTiler / self-hosted
+    # Nominatim / similar by changing only these two settings.
+    locationiq_api_key: str = ""  # empty disables the geocoder entirely
+    locationiq_base_url: str = "https://us1.locationiq.com/v1"
+
+    # User-Agent string sent on every geocoder request. Required by both
+    # OSMF Nominatim policy and LocationIQ TOS. Identifies the application
+    # so the provider can reach us if our traffic looks problematic.
+    geocoder_user_agent: str = (
+        "clear-pipeline/1.0 (https://clearinitiative.io; ops@clearinitiative.io)"
+    )
+
+    # Cache TTLs (seconds) per response status. Successful geocodes are
+    # cached aggressively (~6 months) since place names rarely change.
+    # Empty results are cached for ~30 days — they might exist later.
+    # Errors are cached briefly so we don't hammer the geocoder while it's
+    # degraded but also recover quickly when it comes back.
+    geocoder_cache_ttl_ok_seconds: int = 6 * 30 * 24 * 60 * 60  # ~180 days
+    geocoder_cache_ttl_no_result_seconds: int = 30 * 24 * 60 * 60  # 30 days
+    geocoder_cache_ttl_error_seconds: int = 60 * 60  # 1 hour
+
+    # Rate-limit floor (seconds between calls). LocationIQ free tier allows
+    # 2 req/sec burst; we play it safe at 1 req/sec sustained so multiple
+    # Celery workers can share the budget without coordination.
+    geocoder_min_interval_seconds: float = 1.0
+
+    # Circuit breaker: trip after this many consecutive failures, stay open
+    # for this many seconds. While open, the client returns None instead of
+    # calling the geocoder — callers fall back to coord-based resolution.
+    geocoder_circuit_failure_threshold: int = 3
+    geocoder_circuit_open_seconds: int = 5 * 60  # 5 minutes
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

@@ -5,20 +5,35 @@ Runs after a crisis is created or an event is added to it. Populates:
   - populationInArea (sum of admin-level-2 populations for the event districts)
   - title + summary (Claude-generated narrative from the linked events)
 
+The `summary` field stored on the crisis is the JSON-serialised form of
+`{description, tldr}` — see `CrisisNarrative` for the schema. The column on
+the database stays a plain string; consumers JSON.parse it.
+
 Both outputs are written back in a single updateCrisisPopulation mutation
 so the crisis record is always consistent.
 """
 
+import json
 import logging
 
 from src.celery_app import app
 from src.clients import graphql
 from src.clients.claude import ClaudeRateLimited, call_claude
-from src.models.clear import CrisisNarrative
+from src.models.clear import (
+    CrisisNarrative,
+    CrisisNeedsAnalysis,
+    CrisisScenarios,
+)
 from src.prompts.crisis import (
     CRISIS_PROMPT_VERSION,
+    NEEDS_ANALYSIS_PROMPT_VERSION,
+    NEEDS_ANALYSIS_SYSTEM_PROMPT,
+    SCENARIOS_PROMPT_VERSION,
+    SCENARIOS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_crisis_prompt,
+    build_needs_analysis_prompt,
+    build_scenarios_prompt,
 )
 from src.services.population import estimate_population_for_districts
 
@@ -115,12 +130,9 @@ def _compute_population_in_area(district_ids: list[str]) -> int | None:
     return total
 
 
-def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
-    """Generate (title, summary) for a crisis via Claude."""
-    if not events:
-        return None
-
-    # Collect distinct location names from events
+def _collect_location_names(events: list[dict]) -> list[str]:
+    """Distinct origin/destination/general location names across the events.
+    Order-stable so the prompt is reproducible across runs with the same input."""
     locations: list[str] = []
     seen: set[str] = set()
     for e in events:
@@ -129,7 +141,75 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
             if loc and loc.get("name") and loc["name"] not in seen:
                 locations.append(loc["name"])
                 seen.add(loc["name"])
+    return locations
 
+
+def _generate_needs_analysis(events: list[dict]) -> dict | None:
+    """Generate an NRC SAF-framework needs analysis for a crisis via Claude.
+
+    Returns a dict shaped as `{generalSummary, sector}`, suitable for a
+    JSONB merge into the existing `crises.needs` object. Returns None on
+    any failure — analysis is best-effort enrichment.
+    """
+    if not events:
+        return None
+
+    locations = _collect_location_names(events)
+    prompt = build_needs_analysis_prompt(events, locations)
+
+    try:
+        result_data = call_claude(
+            NEEDS_ANALYSIS_SYSTEM_PROMPT,
+            prompt,
+            stage="crisis-needs-analysis",
+            prompt_version=NEEDS_ANALYSIS_PROMPT_VERSION,
+        )
+        parsed = CrisisNeedsAnalysis.model_validate(result_data)
+        return parsed.model_dump()
+    except Exception as e:
+        logger.error("[CRISIS] Needs analysis generation failed: %s", e, exc_info=True)
+        return None
+
+
+def _generate_scenarios(events: list[dict]) -> dict | None:
+    """Generate forward-looking scenarios for a crisis via Claude.
+
+    Returns a dict with keys {most_likely, best_case, worst_case, description},
+    suitable for storing directly on `crises.scenarios` (JSONB). Returns None
+    on any failure — scenarios are best-effort enrichment.
+    """
+    if not events:
+        return None
+
+    locations = _collect_location_names(events)
+    prompt = build_scenarios_prompt(events, locations)
+
+    try:
+        result_data = call_claude(
+            SCENARIOS_SYSTEM_PROMPT,
+            prompt,
+            stage="crisis-scenarios",
+            prompt_version=SCENARIOS_PROMPT_VERSION,
+        )
+        scenarios = CrisisScenarios.model_validate(result_data)
+        return scenarios.model_dump()
+    except Exception as e:
+        logger.error("[CRISIS] Scenarios generation failed: %s", e, exc_info=True)
+        return None
+
+
+def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
+    """Generate (title, summary) for a crisis via Claude.
+
+    Returns:
+      - title: short headline
+      - summary: JSON-serialised `{description, tldr}` — the database column
+        stays a string; UI consumers JSON.parse on read.
+    """
+    if not events:
+        return None
+
+    locations = _collect_location_names(events)
     prompt = build_crisis_prompt(events, locations)
 
     try:
@@ -140,7 +220,11 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
             prompt_version=CRISIS_PROMPT_VERSION,
         )
         narrative = CrisisNarrative.model_validate(result_data)
-        return narrative.title, narrative.summary
+        summary_json = json.dumps(
+            {"description": narrative.description, "tldr": narrative.tldr},
+            ensure_ascii=False,
+        )
+        return narrative.title, summary_json
     except Exception as e:
         logger.error("[CRISIS] Narrative generation failed: %s", e, exc_info=True)
         return None
@@ -170,32 +254,66 @@ def enrich_crisis(
 
         title: str | None = None
         summary: str | None = None
-        if generate_narrative and event_ids:
-            # Fetch full event details
+        scenarios: dict | None = None
+        needs_analysis: dict | None = None
+        if event_ids:
+            # Fetch full event details once; all Claude calls reuse them.
             events: list[dict] = []
             for eid in event_ids:
                 e = graphql.get_event_for_crisis(eid)
                 if e:
                     events.append(e)
 
-            result = _generate_narrative(events)
-            if result:
-                title, summary = result
-                logger.info("[CRISIS] Narrative: title=%r", title)
+            # `generate_narrative` only gates title/summary regeneration —
+            # those are user-overridable fields and we shouldn't clobber what
+            # a human wrote on createCrisisFromEvents. Scenarios and
+            # clarification are net-new structured fields with no
+            # user-provided counterpart, so they always regenerate when the
+            # event set changes (create / add / remove).
+            if generate_narrative:
+                result = _generate_narrative(events)
+                if result:
+                    title, summary = result
+                    logger.info("[CRISIS] Narrative: title=%r", title)
 
-        # Single write-back for everything we have
+            scenarios = _generate_scenarios(events)
+            if scenarios:
+                logger.info(
+                    "[CRISIS] Scenarios generated (most_likely=%d chars)",
+                    len(scenarios.get("most_likely", "")),
+                )
+
+            needs_analysis = _generate_needs_analysis(events)
+            if needs_analysis:
+                logger.info(
+                    "[CRISIS] Needs analysis generated (generalSummary=%d chars)",
+                    len(needs_analysis.get("generalSummary", "")),
+                )
+
+        # Population + narrative + scenarios in one mutation; needs analysis
+        # merges into `needs` via a dedicated mutation so we don't clobber
+        # other keys already on the JSONB object.
         graphql.update_crisis_population(
             crisis_id,
             population_in_area=population_in_area,
             title=title,
             summary=summary,
+            scenarios=scenarios,
         )
+        if needs_analysis:
+            graphql.set_crisis_needs_analysis(
+                crisis_id,
+                general_summary=needs_analysis["generalSummary"],
+                sector=needs_analysis["sector"],
+            )
 
         return {
             "crisis_id": crisis_id,
             "population_in_area": population_in_area,
             "title": title,
             "summary": summary,
+            "scenarios": scenarios,
+            "needs_analysis": needs_analysis,
         }
 
     except ClaudeRateLimited as exc:

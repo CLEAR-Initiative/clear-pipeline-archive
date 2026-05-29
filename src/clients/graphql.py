@@ -41,6 +41,14 @@ mutation UpdateSignalSeverity($id: String!, $severity: Int!) {
 }
 """
 
+UPDATE_SIGNAL_GEOPARSED_DATA = """
+mutation UpdateSignalGeoparsedData($id: String!, $geoparsedData: JSON!) {
+  updateSignalGeoparsedData(id: $id, geoparsedData: $geoparsedData) {
+    id
+  }
+}
+"""
+
 CREATE_EVENT = """
 mutation CreateEvent($input: CreateEventInput!) {
   createEvent(input: $input) {
@@ -132,6 +140,22 @@ mutation UpdateCrisisPopulation($id: String!, $input: UpdateCrisisPopulationInpu
 }
 """
 
+SET_CRISIS_NEEDS_ANALYSIS = """
+mutation SetCrisisNeedsAnalysis(
+  $id: String!,
+  $generalSummary: String!,
+  $sector: JSON!,
+) {
+  setCrisisNeedsAnalysis(
+    id: $id,
+    generalSummary: $generalSummary,
+    sector: $sector,
+  ) {
+    id
+  }
+}
+"""
+
 GET_LOCATION_WITH_GEOMETRY = """
 query LocationWithGeometry($id: String!) {
   location(id: $id) {
@@ -166,9 +190,9 @@ query EventForCrisis($id: String!) {
     types
     severity
     populationAffected
-    originLocation { name }
-    destinationLocation { name }
-    generalLocation { name }
+    originLocation { name metadata { type data } }
+    destinationLocation { name metadata { type data } }
+    generalLocation { name metadata { type data } }
   }
 }
 """
@@ -397,6 +421,17 @@ def update_signal_severity(signal_id: str, severity: int) -> dict:
     return result["updateSignalSeverity"]
 
 
+def update_signal_geoparsed_data(signal_id: str, geoparsed_data: dict) -> dict:
+    """Attach the geoparser's structured result to an existing signal.
+    Used by the manual-signal pipeline path, where the signal is created
+    before the geoparser has run."""
+    result = _execute(
+        UPDATE_SIGNAL_GEOPARSED_DATA,
+        {"id": signal_id, "geoparsedData": geoparsed_data},
+    )
+    return result["updateSignalGeoparsedData"]
+
+
 def create_event(input_data: dict) -> dict:
     result = _execute(CREATE_EVENT, {"input": input_data})
     return result["createEvent"]
@@ -532,12 +567,33 @@ def archive_stale_alerts(older_than_days: int = 14) -> int:
     return int(result["archiveStaleAlerts"]["alertsArchived"])
 
 
+def set_crisis_needs_analysis(
+    crisis_id: str,
+    *,
+    general_summary: str,
+    sector: dict,
+) -> dict:
+    """Merge an LLM-generated SAF needs analysis into the crisis's `needs`
+    JSONB. Server-side JSONB `||` merge overwrites `generalSummary` and
+    `sector` keys only — other keys on `needs` stay intact."""
+    result = _execute(
+        SET_CRISIS_NEEDS_ANALYSIS,
+        {
+            "id": crisis_id,
+            "generalSummary": general_summary,
+            "sector": sector,
+        },
+    )
+    return result["setCrisisNeedsAnalysis"]
+
+
 def update_crisis_population(
     crisis_id: str,
     population_affected: int | None = None,
     population_in_area: int | None = None,
     title: str | None = None,
     summary: str | None = None,
+    scenarios: dict | None = None,
 ) -> dict:
     input_data: dict = {}
     if population_affected is not None:
@@ -548,6 +604,8 @@ def update_crisis_population(
         input_data["title"] = title
     if summary is not None:
         input_data["summary"] = summary
+    if scenarios is not None:
+        input_data["scenarios"] = scenarios
     result = _execute(
         UPDATE_CRISIS_POPULATION,
         {"id": crisis_id, "input": input_data},
@@ -602,3 +660,114 @@ def get_all_location_metadata(type_: str) -> list[dict]:
     """Return every locationMetadata row of a given type across all locations."""
     result = _execute(ALL_LOCATION_METADATA, {"type": type_})
     return result.get("allLocationMetadata", []) or []
+
+
+# ─── Nominatim geocoder cache ─────────────────────────────────────────────
+
+GET_NOMINATIM_CACHE_ENTRY = """
+query NominatimCacheEntry($queryHash: String!) {
+  nominatimCacheEntry(queryHash: $queryHash) {
+    id
+    queryHash
+    query
+    endpoint
+    responseJson
+    status
+    fetchedAt
+    expiresAt
+  }
+}
+"""
+
+UPSERT_NOMINATIM_CACHE = """
+mutation UpsertNominatimCache($input: UpsertNominatimCacheInput!) {
+  upsertNominatimCache(input: $input) {
+    id
+    queryHash
+    status
+    expiresAt
+  }
+}
+"""
+
+
+def get_nominatim_cache_entry(query_hash: str) -> dict | None:
+    """Read a cached Nominatim response by query hash. Returns None when the
+    entry is missing or expired (the API filters expired rows server-side)."""
+    result = _execute(GET_NOMINATIM_CACHE_ENTRY, {"queryHash": query_hash})
+    return result.get("nominatimCacheEntry")
+
+
+def upsert_nominatim_cache(
+    *,
+    query_hash: str,
+    query: str,
+    endpoint: str,
+    response_json: dict | list,
+    status: str,
+    ttl_seconds: int,
+) -> dict:
+    """Write a Nominatim response to the cache. `status` is one of
+    'ok' / 'no_result' / 'error'. The server computes expires_at from
+    ttl_seconds."""
+    result = _execute(
+        UPSERT_NOMINATIM_CACHE,
+        {
+            "input": {
+                "queryHash": query_hash,
+                "query": query,
+                "endpoint": endpoint,
+                "responseJson": response_json,
+                "status": status,
+                "ttlSeconds": ttl_seconds,
+            }
+        },
+    )
+    return result["upsertNominatimCache"]
+
+
+# ─── Geoparser L4 promotion ────────────────────────────────────────────────
+
+FIND_OR_CREATE_LANDMARK_L4 = """
+mutation FindOrCreateLandmarkL4($input: FindOrCreateLandmarkL4Input!) {
+  findOrCreateLandmarkL4(input: $input) {
+    locationId
+    reused
+    pointType
+    abortedReason
+  }
+}
+"""
+
+
+def find_or_create_landmark_l4(
+    *,
+    name: str,
+    lat: float,
+    lng: float,
+    kind: str,
+    source_lat: float | None = None,
+    source_lng: float | None = None,
+) -> dict:
+    """Promote a geoparsed candidate into a reusable L4 location.
+
+    Returns the resolver result:
+      { locationId: str|None, reused: bool, pointType: str|None,
+        abortedReason: "different_a2"|None }
+
+    When abortedReason is set, the caller should fall back to source coords
+    (no L4 promotion) — the candidate's A2 didn't match the source's A2 and
+    promoting would mis-attribute the signal.
+    """
+    payload: dict = {
+        "name": name,
+        "lat": lat,
+        "lng": lng,
+        "kind": kind,
+    }
+    if source_lat is not None:
+        payload["sourceLat"] = source_lat
+    if source_lng is not None:
+        payload["sourceLng"] = source_lng
+    result = _execute(FIND_OR_CREATE_LANDMARK_L4, {"input": payload})
+    return result["findOrCreateLandmarkL4"]

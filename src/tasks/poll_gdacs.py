@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from src.celery_app import app
 from src.clients.gdacs import fetch_gdacs_events, get_last_synced
 from src.clients.graphql import GraphQLClientError, create_signal, get_data_sources
+from src.services.signal import enrich_with_geoparser
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +46,21 @@ def _build_signal_input(event: dict, source_id: str) -> dict:
         "severity": event.get("severity"),
     }
 
-    # Pass lat/lng for server-side PostGIS geo-resolution
+    # Pass lat/lng for server-side PostGIS geo-resolution. Set before the
+    # geoparser call below so the same-A2 safety check has source coords.
     if event.get("lat") is not None and event.get("lng") is not None:
         input_data["lat"] = event["lat"]
         input_data["lng"] = event["lng"]
+
+    # Text-based geoparser: enrich `geoparsedData` and, when a landmark
+    # resolves cleanly, promote it to a reusable L4 (overriding the default
+    # "signal-title L4" branch in clear-api). Best-effort.
+    enrich_with_geoparser(
+        input_data,
+        title=event["title"],
+        description=event.get("description"),
+        log_tag=f"gdacs:{event.get('gdacs_id')}",
+    )
 
     return input_data
 

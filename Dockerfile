@@ -11,6 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml .
+
+# Install CPU-only torch FIRST from the PyTorch CPU wheel index. Default torch
+# wheels include ~3.5 GB of CUDA libraries (libcurand, libcublas, etc.) which
+# are useless on CPU-only Infomaniak VMs and bloat the image past the disk
+# quota. When sentence-transformers is installed below, its transitive torch
+# requirement is satisfied by what we put in here, so no GPU build gets pulled.
+RUN uv pip install --system --no-cache \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch
+
 RUN uv pip install --system --no-cache .
 
 # Pre-download the sentence-transformer model so workers don't stall on first
