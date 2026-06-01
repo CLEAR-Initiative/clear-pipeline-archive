@@ -18,6 +18,8 @@ dependencies = [
     # Event classifier (lexical + semantic grouping)
     "rapidfuzz>=3.10",
     "sentence-transformers>=3.0",
+    # Error tracking (Sentry-protocol — works with GlitchTip too)
+    "sentry-sdk[celery]>=2.0",
 ]
 
 [project.optional-dependencies]

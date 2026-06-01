@@ -504,7 +504,6 @@ def _match_and_act(
         )
         pop_displaced = _resolve_population_displaced(
             claude_value=rewrite.population_displaced if rewrite else None,
-            admin2_id=admin2_id,
         )
         # Subsequent-signal stats: add casualties to the running total, take
         # max() for populationAffected. Per-signal values prefer raw-extracted
