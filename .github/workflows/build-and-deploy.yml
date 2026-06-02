@@ -81,7 +81,10 @@ jobs:
             set -e
             cd /srv/app
             docker compose pull clear-pipeline
-            docker compose up -d clear-pipeline
+            # --force-recreate ensures the container picks up the freshly
+            # pulled image (compose sometimes skips recreation when only the
+            # image SHA changed, leaving the old container running).
+            docker compose up -d --force-recreate clear-pipeline
             # Aggressive prune: remove every image not currently in use by a
             # running container (not just dangling). Keeps the 20 GB root disk
             # from filling up as old :dev tags accumulate over many deploys.

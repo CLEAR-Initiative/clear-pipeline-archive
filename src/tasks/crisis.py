@@ -163,6 +163,12 @@ def _generate_needs_analysis(events: list[dict]) -> dict | None:
             prompt,
             stage="crisis-needs-analysis",
             prompt_version=NEEDS_ANALYSIS_PROMPT_VERSION,
+            # Six sector blocks × four fields × prose + the wrapping JSON
+            # overhead routinely exceeds the 1024-default. Truncation cuts
+            # the response mid-object; `_extract_json` then can't close the
+            # outer `{` and we error out at char 0. 4096 gives comfortable
+            # headroom for the structured output without inflating cost.
+            max_tokens=4096,
         )
         parsed = CrisisNeedsAnalysis.model_validate(result_data)
         return parsed.model_dump()
