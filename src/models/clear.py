@@ -151,18 +151,35 @@ class SectorAnalysis(BaseModel):
 class CrisisNeedsAnalysis(BaseModel):
     """Output from Claude needs-analysis generation (NRC SAF framework).
 
-    Top-level `generalSummary` (overall narrative) + `sector` (per-sector
+    Top-level `generalSummary` (4 bullet points) + `sector` (per-sector
     breakdown keyed by canonical NRC sector names — see `NEEDS_SECTORS`).
     Stored under `crises.needs.{generalSummary, sector}` via a JSONB merge
     so other keys the user supplied at creation time stay intact.
+
+    `generalSummary` is a list of bullet strings; the prompt asks for
+    exactly 4 (overall severity & confidence, drivers, response gaps,
+    priority action) but we accept any non-empty list so a small Claude
+    drift doesn't cause the whole analysis to be rejected.
 
     Sector keys are validated against `NEEDS_SECTORS` — unknown keys are
     rejected (no hallucinated sectors), but the LLM may legitimately omit
     sectors that are clearly Minimal or out-of-scope for a given crisis.
     """
 
-    generalSummary: str
+    generalSummary: list[str]
     sector: dict[str, SectorAnalysis]
+
+    @field_validator("generalSummary")
+    @classmethod
+    def _validate_general_summary(cls, v: list[str]) -> list[str]:
+        # Non-empty list of non-empty strings. We don't enforce exactly 4
+        # at validation time — the prompt drives the count and a 3-or-5
+        # response is still useful enough to keep.
+        if not v:
+            raise ValueError("generalSummary must contain at least one bullet")
+        if any(not isinstance(item, str) or not item.strip() for item in v):
+            raise ValueError("generalSummary entries must be non-empty strings")
+        return v
 
     @field_validator("sector")
     @classmethod
