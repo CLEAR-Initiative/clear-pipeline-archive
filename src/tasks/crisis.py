@@ -16,6 +16,8 @@ so the crisis record is always consistent.
 import json
 import logging
 
+import anthropic
+
 from src.celery_app import app
 from src.clients import graphql
 from src.clients.claude import ClaudeRateLimited, call_claude
@@ -172,6 +174,11 @@ def _generate_needs_analysis(events: list[dict]) -> dict | None:
         )
         parsed = CrisisNeedsAnalysis.model_validate(result_data)
         return parsed.model_dump()
+    except (anthropic.APIStatusError, ClaudeRateLimited):
+        # Transient — Anthropic 5xx / 429 / 529 Overloaded. Re-raise so
+        # `enrich_crisis` retries the whole task via Celery rather than
+        # silently producing a crisis with no needs analysis.
+        raise
     except Exception as e:
         logger.error("[CRISIS] Needs analysis generation failed: %s", e, exc_info=True)
         return None
@@ -199,6 +206,9 @@ def _generate_scenarios(events: list[dict]) -> dict | None:
         )
         scenarios = CrisisScenarios.model_validate(result_data)
         return scenarios.model_dump()
+    except (anthropic.APIStatusError, ClaudeRateLimited):
+        # Transient — see _generate_needs_analysis for the rationale.
+        raise
     except Exception as e:
         logger.error("[CRISIS] Scenarios generation failed: %s", e, exc_info=True)
         return None
@@ -231,6 +241,9 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
             ensure_ascii=False,
         )
         return narrative.title, summary_json
+    except (anthropic.APIStatusError, ClaudeRateLimited):
+        # Transient — see _generate_needs_analysis for the rationale.
+        raise
     except Exception as e:
         logger.error("[CRISIS] Narrative generation failed: %s", e, exc_info=True)
         return None
@@ -328,6 +341,17 @@ def enrich_crisis(
             exc.retry_after,
         )
         raise self.retry(exc=exc, countdown=int(exc.retry_after))
+    except anthropic.APIStatusError as exc:
+        # 5xx / 529 Overloaded / other transient Anthropic API errors. The
+        # SDK has already exhausted its internal retries by the time we see
+        # this. Back off longer than the generic 30s — observed overload
+        # windows can last 60-120s, and a too-quick retry will just hit
+        # the same overload.
+        logger.warning(
+            "[CRISIS] Anthropic %s — retrying in 120s. crisis=%s",
+            type(exc).__name__, crisis_id,
+        )
+        raise self.retry(exc=exc, countdown=120)
     except graphql.GraphQLClientError as exc:
         logger.error(
             "[CRISIS] enrich_crisis %s permanently failed (non-retryable): %s",

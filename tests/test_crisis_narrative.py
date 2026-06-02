@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import anthropic
+import httpx
 import pytest
 
 from src.models.clear import (
@@ -37,11 +39,24 @@ from src.prompts.crisis import (
     build_needs_analysis_prompt,
     build_scenarios_prompt,
 )
+from src.clients.claude import ClaudeRateLimited
 from src.tasks.crisis import (
     _generate_narrative,
     _generate_needs_analysis,
     _generate_scenarios,
 )
+
+
+def _fake_overloaded_error() -> anthropic.APIStatusError:
+    """Construct a real 529-shaped APIStatusError the way the SDK raises
+    one (the production 529 surfaces as `anthropic._exceptions.OverloadedError`,
+    a private subclass of the public `APIStatusError` — we catch the base
+    class in production, so constructing the base class here is enough)."""
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx.Response(status_code=529, request=req)
+    return anthropic.APIStatusError(
+        "Overloaded", response=resp, body={"type": "error"},
+    )
 
 
 class TestCrisisNarrativeModel:
@@ -181,6 +196,23 @@ class TestGenerateNarrative:
             result = _generate_narrative(self._EVENT_FIXTURE)
         assert result is None
 
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic 5xx / 529 Overloaded / rate-limit errors must NOT be
+        swallowed as None — they bubble to `enrich_crisis` so Celery can
+        retry the whole task instead of producing a crisis with no
+        narrative. This is the bug the 529 incident exposed."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_narrative(self._EVENT_FIXTURE)
+
+    def test_re_raises_claude_rate_limited(self):
+        """`ClaudeRateLimited` (wrapped 429) must also bubble so Celery
+        applies the retry_after backoff, not swallowed."""
+        rl = ClaudeRateLimited("Rate limited", retry_after=30.0)
+        with patch("src.tasks.crisis.call_claude", side_effect=rl):
+            with pytest.raises(ClaudeRateLimited):
+                _generate_narrative(self._EVENT_FIXTURE)
+
     def test_returns_none_for_empty_event_list(self):
         """Sanity: don't call Claude for an empty event list."""
         with patch("src.tasks.crisis.call_claude") as mock_claude:
@@ -310,6 +342,13 @@ class TestGenerateScenarios:
         with patch("src.tasks.crisis.call_claude", return_value=bad):
             result = _generate_scenarios(self._EVENT_FIXTURE)
         assert result is None
+
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic API errors bubble so Celery retries — see the
+        same test on _generate_narrative for full rationale."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_scenarios(self._EVENT_FIXTURE)
 
     def test_returns_none_for_empty_event_list(self):
         """Sanity: don't call Claude for an empty event list."""
@@ -774,6 +813,13 @@ class TestGenerateNeedsAnalysis:
         ):
             result = _generate_needs_analysis(self._EVENT_FIXTURE)
         assert result is None
+
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic API errors bubble so Celery retries — see the
+        same test on _generate_narrative for full rationale."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_needs_analysis(self._EVENT_FIXTURE)
 
     def test_returns_none_for_empty_event_list(self):
         with patch("src.tasks.crisis.call_claude") as mock_claude:
