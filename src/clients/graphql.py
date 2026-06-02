@@ -143,7 +143,7 @@ mutation UpdateCrisisPopulation($id: String!, $input: UpdateCrisisPopulationInpu
 SET_CRISIS_NEEDS_ANALYSIS = """
 mutation SetCrisisNeedsAnalysis(
   $id: String!,
-  $generalSummary: String!,
+  $generalSummary: [String!]!,
   $sector: JSON!,
 ) {
   setCrisisNeedsAnalysis(
@@ -570,12 +570,16 @@ def archive_stale_alerts(older_than_days: int = 14) -> int:
 def set_crisis_needs_analysis(
     crisis_id: str,
     *,
-    general_summary: str,
+    general_summary: list[str],
     sector: dict,
 ) -> dict:
     """Merge an LLM-generated SAF needs analysis into the crisis's `needs`
     JSONB. Server-side JSONB `||` merge overwrites `generalSummary` and
-    `sector` keys only — other keys on `needs` stay intact."""
+    `sector` keys only — other keys on `needs` stay intact.
+
+    `general_summary` is the 4-bullet array produced by the
+    `CrisisNeedsAnalysis` Pydantic model; the GraphQL mutation accepts
+    `[String!]!`."""
     result = _execute(
         SET_CRISIS_NEEDS_ANALYSIS,
         {
