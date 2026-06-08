@@ -159,10 +159,21 @@ You MUST respond with valid JSON only — no markdown, no explanation before or 
 NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE = """\
 Produce a structured needs analysis with two parts:
 
-1. `generalSummary` — A 2-3 sentence paragraph synthesising:
-   - Overall severity on the SAF five-level scale (Minimal / Stressed / Severe / Extreme / Catastrophic), with the sectors driving it and confidence level (High / Medium / Low).
-   - The 1-2 causal factors that explain *why* conditions are what they are (e.g. "displacement has severed access to markets, compounding food insecurity that pre-dates the conflict") — not just a restatement of the indicators.
-   - The priority action implied by SAF Dimension 7: immediate life-saving response, stabilisation response, assessment-first (RNA), or monitoring.
+1. `generalSummary` — An array of EXACTLY 4 bullet points. Each bullet is
+   ONE short sentence (≤25 words, ~180 characters). No leading dashes,
+   no markdown, no line breaks inside a bullet. Brevity matters — a
+   responder is scanning these on a phone, not reading a paragraph.
+   The four bullets cover, in order:
+   1. Overall severity on the SAF five-level scale (Minimal / Stressed /
+      Severe / Extreme / Catastrophic), the 1-2 sectors driving it, and
+      a confidence level (High / Medium / Low).
+   2. The single causal factor that explains *why* conditions are what
+      they are — not a restatement of the indicators.
+   3. The most acute response gap — one Severe-or-above sector with no
+      3W cluster actor, with a brief NRC-fit note.
+   4. The priority action implied by SAF Dimension 7: immediate
+      life-saving response, stabilisation response, assessment-first
+      (RNA), or monitoring.
 
 2. `sector` — An object keyed by NRC sector. Produce one entry for each of
    the six sectors below. Each entry has these required fields:
@@ -212,7 +223,12 @@ four fields (description, severity, responseGap, nrcRelevant) — the API
 rejects partial entries.
 
 {{
-  "generalSummary": "<2-3 sentence synthesis of severity, drivers, and priority action>",
+  "generalSummary": [
+    "<≤25 words: overall severity, driver sector(s), confidence>",
+    "<≤25 words: the single causal factor>",
+    "<≤25 words: most acute response gap, NRC fit>",
+    "<≤25 words: SAF priority action>"
+  ],
   "sector": {{
     "Shelter": {{
       "description": "<2-3 sentences on shelter conditions, response gap, NRC fit>",

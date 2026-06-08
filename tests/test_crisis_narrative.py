@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import anthropic
+import httpx
 import pytest
 
 from src.models.clear import (
@@ -37,11 +39,24 @@ from src.prompts.crisis import (
     build_needs_analysis_prompt,
     build_scenarios_prompt,
 )
+from src.clients.claude import ClaudeRateLimited
 from src.tasks.crisis import (
     _generate_narrative,
     _generate_needs_analysis,
     _generate_scenarios,
 )
+
+
+def _fake_overloaded_error() -> anthropic.APIStatusError:
+    """Construct a real 529-shaped APIStatusError the way the SDK raises
+    one (the production 529 surfaces as `anthropic._exceptions.OverloadedError`,
+    a private subclass of the public `APIStatusError` — we catch the base
+    class in production, so constructing the base class here is enough)."""
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx.Response(status_code=529, request=req)
+    return anthropic.APIStatusError(
+        "Overloaded", response=resp, body={"type": "error"},
+    )
 
 
 class TestCrisisNarrativeModel:
@@ -181,6 +196,23 @@ class TestGenerateNarrative:
             result = _generate_narrative(self._EVENT_FIXTURE)
         assert result is None
 
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic 5xx / 529 Overloaded / rate-limit errors must NOT be
+        swallowed as None — they bubble to `enrich_crisis` so Celery can
+        retry the whole task instead of producing a crisis with no
+        narrative. This is the bug the 529 incident exposed."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_narrative(self._EVENT_FIXTURE)
+
+    def test_re_raises_claude_rate_limited(self):
+        """`ClaudeRateLimited` (wrapped 429) must also bubble so Celery
+        applies the retry_after backoff, not swallowed."""
+        rl = ClaudeRateLimited("Rate limited", retry_after=30.0)
+        with patch("src.tasks.crisis.call_claude", side_effect=rl):
+            with pytest.raises(ClaudeRateLimited):
+                _generate_narrative(self._EVENT_FIXTURE)
+
     def test_returns_none_for_empty_event_list(self):
         """Sanity: don't call Claude for an empty event list."""
         with patch("src.tasks.crisis.call_claude") as mock_claude:
@@ -311,6 +343,13 @@ class TestGenerateScenarios:
             result = _generate_scenarios(self._EVENT_FIXTURE)
         assert result is None
 
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic API errors bubble so Celery retries — see the
+        same test on _generate_narrative for full rationale."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_scenarios(self._EVENT_FIXTURE)
+
     def test_returns_none_for_empty_event_list(self):
         """Sanity: don't call Claude for an empty event list."""
         with patch("src.tasks.crisis.call_claude") as mock_claude:
@@ -338,8 +377,12 @@ class TestCrisisNeedsAnalysisModel:
     rejected so the LLM can't introduce hallucinated sector names."""
 
     _FULL_SECTOR_PAYLOAD = {
-        "generalSummary": "Severe overall — food security and protection drive "
-                          "the classification; confidence Medium given 8-month MSNA age.",
+        "generalSummary": [
+            "Severe — food security and protection drive; confidence Medium (8-month MSNA).",
+            "Displacement has severed market access, compounding pre-existing food insecurity.",
+            "Education cluster absent in 3W; NRC has core competency.",
+            "Priority action: assessment-first (RNA) pending school-closure verification.",
+        ],
         "sector": {
             "Shelter": {
                 "description": "Severe — 40% of HHs report inadequate shelter.",
@@ -382,7 +425,14 @@ class TestCrisisNeedsAnalysisModel:
 
     def test_accepts_all_six_sectors(self):
         result = CrisisNeedsAnalysis.model_validate(self._FULL_SECTOR_PAYLOAD)
-        assert result.generalSummary.startswith("Severe overall")
+        assert len(result.generalSummary) == 4
+        # Brevity invariant for the fixture: every bullet ≤ 25 words.
+        # Drift in either direction (looser fixture, tighter cap) should
+        # show up here before it shows up in production.
+        for bullet in result.generalSummary:
+            assert len(bullet.split()) <= 25, (
+                f"Fixture bullet exceeds 25-word brevity cap: {bullet!r}"
+            )
         assert set(result.sector.keys()) == set(NEEDS_SECTORS)
         assert result.sector["Food Security"].description.startswith("Severe")
 
@@ -390,7 +440,7 @@ class TestCrisisNeedsAnalysisModel:
         """LLM may legitimately produce only the sectors that matter for a
         crisis — partial subsets of NEEDS_SECTORS are accepted."""
         payload = {
-            "generalSummary": "...",
+            "generalSummary": ["bullet"],
             "sector": {
                 "Food Security": {
                     "description": "Severe.", "severity": "Severe",
@@ -408,7 +458,7 @@ class TestCrisisNeedsAnalysisModel:
     def test_rejects_unknown_sector_key(self):
         """A sector name outside NEEDS_SECTORS is a hallucination — reject it."""
         payload = {
-            "generalSummary": "...",
+            "generalSummary": ["bullet"],
             "sector": {
                 "Shelter": {
                     "description": "...", "severity": "Severe",
@@ -428,7 +478,7 @@ class TestCrisisNeedsAnalysisModel:
         content (indicator percentages, cluster actors, recommendation) so
         the schema can grow without a Pydantic change."""
         payload = {
-            "generalSummary": "...",
+            "generalSummary": ["bullet"],
             "sector": {
                 "Food Security": {
                     "description": "Severe — 58% food insecure.",
@@ -458,7 +508,7 @@ class TestCrisisNeedsAnalysisModel:
             "nrcRelevant": True,
         }
         partial = {k: v for k, v in full.items() if k != missing_field}
-        payload = {"generalSummary": "...", "sector": {"Shelter": partial}}
+        payload = {"generalSummary": ["bullet"], "sector": {"Shelter": partial}}
         with pytest.raises(Exception):
             CrisisNeedsAnalysis.model_validate(payload)
 
@@ -468,7 +518,7 @@ class TestCrisisNeedsAnalysisModel:
     )
     def test_accepts_all_saf_severity_levels(self, level: str):
         payload = {
-            "generalSummary": "...",
+            "generalSummary": ["bullet"],
             "sector": {
                 "Shelter": {
                     "description": "...",
@@ -485,7 +535,7 @@ class TestCrisisNeedsAnalysisModel:
         """Casing/spelling matters — the Literal type is strict so the
         prompt's exact strings are the only accepted values."""
         payload = {
-            "generalSummary": "...",
+            "generalSummary": ["bullet"],
             "sector": {
                 "Shelter": {
                     "description": "...",
@@ -508,6 +558,44 @@ class TestCrisisNeedsAnalysisModel:
         with pytest.raises(Exception):
             CrisisNeedsAnalysis.model_validate(bad)
 
+    def test_general_summary_is_list_of_strings(self):
+        """generalSummary must be a list, not a single string. The prompt
+        asks for 4 bullets and the new shape is array-shaped."""
+        bad = {**self._FULL_SECTOR_PAYLOAD, "generalSummary": "single string"}
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(bad)
+
+    def test_general_summary_rejects_empty_list(self):
+        bad = {**self._FULL_SECTOR_PAYLOAD, "generalSummary": []}
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(bad)
+
+    def test_general_summary_rejects_blank_entries(self):
+        """Non-empty list of NON-EMPTY strings — whitespace-only entries fail."""
+        bad = {
+            **self._FULL_SECTOR_PAYLOAD,
+            "generalSummary": ["valid", "   "],
+        }
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(bad)
+
+    def test_general_summary_rejects_non_string_entries(self):
+        bad = {**self._FULL_SECTOR_PAYLOAD, "generalSummary": ["valid", 42]}
+        with pytest.raises(Exception):
+            CrisisNeedsAnalysis.model_validate(bad)
+
+    @pytest.mark.parametrize("count", [1, 3, 4, 5, 6])
+    def test_general_summary_tolerates_bullet_count_drift(self, count: int):
+        """The prompt asks for exactly 4, but Claude occasionally drifts.
+        We accept anything ≥1 so a 3-or-5 response still produces useful
+        output rather than nothing."""
+        payload = {
+            **self._FULL_SECTOR_PAYLOAD,
+            "generalSummary": [f"bullet {i + 1}" for i in range(count)],
+        }
+        result = CrisisNeedsAnalysis.model_validate(payload)
+        assert len(result.generalSummary) == count
+
 
 class TestNeedsAnalysisPromptShape:
     """Pin the SAF prompt template so any drift away from the spec gets
@@ -525,6 +613,38 @@ class TestNeedsAnalysisPromptShape:
         """Both top-level output keys must appear in the JSON schema block."""
         assert '"generalSummary"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
         assert '"sector"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+
+    def test_template_asks_for_exactly_four_bullets(self):
+        """The prompt must specify the bullet count explicitly so Claude
+        produces a 4-element array on `generalSummary`. If this drifts,
+        consumers expecting 4 bullets will see ragged counts."""
+        assert "EXACTLY 4 bullet points" in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+
+    def test_template_caps_bullet_length(self):
+        """The prompt must enforce per-bullet brevity. Without an explicit
+        cap, Claude routinely produces 3-4 line bullets that don't render
+        well on responder UIs. The cap is concrete (≤25 words) rather than
+        the vague 'single sentence' phrasing that drifted in production."""
+        # The exact-cap token + the rationale phrase ('brevity matters')
+        # together pin the constraint. Either alone is fragile to small
+        # prompt edits.
+        assert "≤25 words" in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+        assert "Brevity matters" in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
+
+    def test_template_shows_general_summary_as_json_array(self):
+        """The JSON schema example must render generalSummary as an array,
+        not a single string. Catches a silent regression where the example
+        block falls back to the single-paragraph form."""
+        # The array opening `[` must follow the `"generalSummary":` key.
+        # Find the index and check the next non-whitespace token is `[`.
+        idx = NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE.find('"generalSummary":')
+        assert idx != -1
+        tail = NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE[idx + len('"generalSummary":'):].lstrip()
+        assert tail.startswith("["), (
+            "JSON schema example shows generalSummary as a non-array; "
+            "Claude will return a string and the Pydantic list[str] validator "
+            "will reject every response."
+        )
         assert '"description"' in NEEDS_ANALYSIS_USER_PROMPT_TEMPLATE
 
     def test_template_lists_all_six_sectors(self):
@@ -623,13 +743,12 @@ class TestGenerateNeedsAnalysis:
     ]
 
     _CLAUDE_RESPONSE = {
-        "generalSummary": (
-            "Severe overall — food security and protection drive the "
-            "classification; confidence Medium given 8-month MSNA age. "
-            "Displacement has severed access to markets, compounding "
-            "pre-existing food insecurity. Evidence supports an "
-            "assessment-first (RNA) priority action."
-        ),
+        "generalSummary": [
+            "Severe — food security and protection drive; confidence Medium (8-month MSNA).",
+            "Displacement has severed market access, compounding pre-existing food insecurity.",
+            "Education cluster absent in 3W; NRC has core competency.",
+            "Priority action: assessment-first (RNA).",
+        ],
         "sector": {
             "Shelter": {
                 "description": "Severe — 40% inadequate shelter.",
@@ -664,7 +783,9 @@ class TestGenerateNeedsAnalysis:
 
         assert result is not None
         assert set(result.keys()) == {"generalSummary", "sector"}
-        assert result["generalSummary"].startswith("Severe overall")
+        assert isinstance(result["generalSummary"], list)
+        assert len(result["generalSummary"]) == 4
+        assert result["generalSummary"][0].startswith("Severe")
         # Per-sector breakdown contains all six canonical sectors and every
         # required SectorAnalysis field on each entry.
         assert set(result["sector"].keys()) == set(NEEDS_SECTORS)
@@ -688,10 +809,17 @@ class TestGenerateNeedsAnalysis:
         keys) → None. Best-effort enrichment, no exception bubbles up."""
         with patch(
             "src.tasks.crisis.call_claude",
-            return_value={"generalSummary": "..."},  # missing `sector`
+            return_value={"generalSummary": ["bullet"]},  # missing `sector`
         ):
             result = _generate_needs_analysis(self._EVENT_FIXTURE)
         assert result is None
+
+    def test_re_raises_transient_anthropic_errors(self):
+        """Anthropic API errors bubble so Celery retries — see the
+        same test on _generate_narrative for full rationale."""
+        with patch("src.tasks.crisis.call_claude", side_effect=_fake_overloaded_error()):
+            with pytest.raises(anthropic.APIStatusError):
+                _generate_needs_analysis(self._EVENT_FIXTURE)
 
     def test_returns_none_for_empty_event_list(self):
         with patch("src.tasks.crisis.call_claude") as mock_claude:
