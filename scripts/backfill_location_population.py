@@ -6,10 +6,15 @@ location at the target admin levels, runs the WorldPop raster mask against
 its geometry, and writes the result back via updateLocationPopulation.
 
 Usage:
-    python scripts/backfill_location_population.py                # levels 0,1,2
+    python scripts/backfill_location_population.py                # SDN, levels 0,1,2
+    python scripts/backfill_location_population.py --iso3 AFG     # Afghanistan
     python scripts/backfill_location_population.py --levels 2     # level 2 only
     python scripts/backfill_location_population.py --levels 0,1   # two levels
     python scripts/backfill_location_population.py --force        # recompute even if populated
+
+The chosen --iso3 must be registered in POPULATION_TIFF_S3_KEYS
+(src/services/population.py); otherwise every row fails with
+FileNotFoundError because the raster can't be located in S3.
 """
 
 import argparse
@@ -41,7 +46,7 @@ def parse_levels(arg: str | None) -> list[int]:
         raise SystemExit(f"Invalid --levels value: {arg!r}")
 
 
-def run(levels: list[int], force: bool) -> dict:
+def run(levels: list[int], force: bool, iso3: str) -> dict:
     """Backfill locations.population. Returns stats dict."""
     stats = {"processed": 0, "updated": 0, "skipped_cached": 0, "skipped_no_geom": 0, "failed": 0}
 
@@ -67,7 +72,7 @@ def run(levels: list[int], force: bool) -> dict:
                 continue
 
             try:
-                pop = estimate_population_for_polygon(detail["geometry"])
+                pop = estimate_population_for_polygon(detail["geometry"], iso3=iso3)
             except Exception as exc:
                 stats["failed"] += 1
                 logger.error("[FAILED raster] %s (%s): %s", loc_name, loc_id, exc)
@@ -101,12 +106,25 @@ def main() -> None:
         action="store_true",
         help="Recompute and overwrite even if population is already set.",
     )
+    parser.add_argument(
+        "--iso3",
+        default="SDN",
+        help=(
+            "Country ISO3 code — selects the WorldPop GeoTIFF via "
+            "POPULATION_TIFF_S3_KEYS in src/services/population.py "
+            "(default: SDN). Examples: SDN, AFG."
+        ),
+    )
     args = parser.parse_args()
 
+    iso3 = args.iso3.upper()
     levels = parse_levels(args.levels)
-    logger.info("Starting population backfill: levels=%s force=%s", levels, args.force)
+    logger.info(
+        "Starting population backfill: iso3=%s levels=%s force=%s",
+        iso3, levels, args.force,
+    )
 
-    stats = run(levels, args.force)
+    stats = run(levels, args.force, iso3)
 
     logger.info(
         "Done: processed=%(processed)d updated=%(updated)d "
