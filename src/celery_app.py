@@ -1,3 +1,6 @@
+import importlib
+import pkgutil
+
 from celery import Celery
 from celery.schedules import crontab, timedelta
 from celery.signals import (
@@ -89,15 +92,20 @@ app.conf.beat_schedule = {
     },
 }
 
-app.conf.include = [
-    "src.tasks.poll",
-    "src.tasks.poll_gdacs",
-    "src.tasks.poll_acled",
-    "src.tasks.process",
-    "src.tasks.notify",
-    "src.tasks.population",
-    "src.tasks.geometries",
-    "src.tasks.crisis",
-    "src.tasks.archive",
-    "src.tasks.dtm",
-]
+# ─── Task autodiscovery ─────────────────────────────────────────────────────
+# Walk src/tasks/*.py and import each so every @app.task decorator
+# registers with the global app at celery_app load time. Dropping a new
+# file under src/tasks/ is now sufficient — no celery_app.py edit needed
+# and no risk of unregistered tasks dropping messages on the floor
+# (see the translate_entity_task incident on 2026-06-16: the new module
+# was missing from the previous explicit include list, and clear-api's
+# lazy-on-read enqueue queued messages the worker silently discarded).
+#
+# Why pkgutil instead of `app.autodiscover_tasks()` — Celery's built-in
+# autodiscover expects each package to have a `tasks` submodule
+# (`<pkg>.tasks`); our layout has tasks as direct siblings inside the
+# `src.tasks` package, which doesn't fit that convention.
+from src import tasks as _tasks_pkg  # noqa: E402  (import after app config)
+
+for _module_info in pkgutil.iter_modules(_tasks_pkg.__path__):
+    importlib.import_module(f"{_tasks_pkg.__name__}.{_module_info.name}")
