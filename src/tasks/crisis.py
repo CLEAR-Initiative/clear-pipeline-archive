@@ -38,6 +38,7 @@ from src.prompts.crisis import (
     build_scenarios_prompt,
 )
 from src.services.population import estimate_population_for_districts
+from src.services.translate import translate_and_upsert
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +250,25 @@ def _generate_narrative(events: list[dict]) -> tuple[str, str] | None:
         return None
 
 
+def _translate_crisis(crisis_id: str) -> dict | None:
+    """Refresh translations for a crisis after the canonical writes have
+    committed. Thin wrapper around `translate_and_upsert` that reads
+    the canonical state back through the API first (so the source we
+    hash matches what readers see).
+
+    Failures here are intentionally non-fatal: a translation miss must
+    not roll back the canonical enrichment. Anthropic rate-limit /
+    overload errors DO propagate so the Celery task's existing retry
+    logic kicks in — the canonical write already committed, so a retry
+    just re-attempts the translation step on the same canonical state.
+    """
+    canonical = graphql.get_crisis_canonical(crisis_id)
+    if not canonical:
+        logger.warning("[TRANSLATE] Crisis %s vanished before translation step", crisis_id)
+        return None
+    return translate_and_upsert("crisis", crisis_id, canonical)
+
+
 @app.task(
     name="src.tasks.crisis.enrich_crisis",
     bind=True,
@@ -326,6 +346,12 @@ def enrich_crisis(
                 sector=needs_analysis["sector"],
             )
 
+        # Translation runs after the canonical writes — reads the four
+        # translatable fields back from the API and only retranslates
+        # what changed. ClaudeRateLimited / anthropic.APIStatusError
+        # bubble up so the surrounding `except` retries the whole task.
+        translation_summary = _translate_crisis(crisis_id)
+
         return {
             "crisis_id": crisis_id,
             "population_in_area": population_in_area,
@@ -333,6 +359,7 @@ def enrich_crisis(
             "summary": summary,
             "scenarios": scenarios,
             "needs_analysis": needs_analysis,
+            "translations": translation_summary,
         }
 
     except ClaudeRateLimited as exc:

@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     claude_model_rewrite: str = ""  # falls back to claude_model
     claude_model_crisis: str = ""  # falls back to claude_model
     claude_model_location: str = "claude-haiku-4-5-20251001"
+    # Translation is mostly mechanical (string-to-string with structure
+    # preservation) — Haiku handles it well at ~10x the price advantage.
+    claude_model_translate: str = "claude-haiku-4-5-20251001"
+
+    # Translation — comma-separated BCP-47 codes. 'en' is the canonical
+    # source and is never a target. Empty string disables translation
+    # entirely, which is the safe default until management says go.
+    target_locales: str = "ar,fr"
 
     # Celery
     celery_broker_url: str = "redis://localhost:6379/0"
