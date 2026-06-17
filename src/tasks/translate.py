@@ -30,6 +30,94 @@ _CANONICAL_GETTERS = {
 
 
 @app.task(
+    name="src.tasks.translate.translate_entities_batch_task",
+    bind=True,
+    acks_late=True,
+)
+def translate_entities_batch_task(self, items: list[dict]) -> dict:
+    """Translate a batch of entities in one task call.
+
+    Replaces N independent translate_entity_task enqueues from clear-api's
+    lazy-on-read path. clear-api buffers misses for ~500ms and pushes the
+    accumulated list as a single broker message; this task fans them out
+    in-process so a 200-miss /detection load hits the broker once
+    instead of 200 times.
+
+    Per-item failures are isolated: a missing canonical row or a Claude
+    rejection on one item doesn't drop the rest. Returns a summary
+    that's visible in worker logs for diagnosing partial failures.
+    """
+    succeeded: list[str] = []
+    failed: list[dict] = []
+    for item in items or []:
+        try:
+            entity_type = str(item.get("entity_type", "")).lower()
+            entity_id = item.get("entity_id")
+            if not entity_type or not entity_id:
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": "missing_entity_type_or_id",
+                })
+                continue
+            getter = _CANONICAL_GETTERS.get(entity_type)
+            if getter is None:
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": f"unknown_entity_type:{entity_type}",
+                })
+                continue
+            try:
+                canonical = getter(entity_id)
+            except graphql.GraphQLClientError as exc:
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": f"canonical_fetch_failed:{exc}",
+                })
+                continue
+            if not canonical:
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": "canonical_not_found",
+                })
+                continue
+            try:
+                translate_and_upsert(entity_type, entity_id, canonical)
+                succeeded.append(entity_id)
+            except (ClaudeRateLimited, anthropic.APIStatusError) as exc:
+                # Transient Claude errors aren't retried at the batch
+                # level — re-enqueueing the whole batch would over-
+                # translate the items that did succeed. The lazy-on-read
+                # path will re-surface the still-missing item on its
+                # next user request.
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": f"claude_transient:{type(exc).__name__}",
+                })
+            except Exception as exc:
+                logger.error(
+                    "[TRANSLATE-BATCH] %s %s failed: %s",
+                    entity_type, entity_id, exc, exc_info=True,
+                )
+                failed.append({
+                    "entity_id": entity_id,
+                    "reason": f"error:{exc}",
+                })
+        except Exception as exc:
+            # Defensive — never let one malformed item crash the batch.
+            logger.error(
+                "[TRANSLATE-BATCH] unexpected error on item %r: %s",
+                item, exc, exc_info=True,
+            )
+            failed.append({"reason": f"unexpected:{exc}"})
+
+    logger.info(
+        "[TRANSLATE-BATCH] processed %d item(s): %d ok, %d failed",
+        len(items or []), len(succeeded), len(failed),
+    )
+    return {"succeeded": succeeded, "failed": failed}
+
+
+@app.task(
     name="src.tasks.translate.translate_entity_task",
     bind=True,
     max_retries=2,
