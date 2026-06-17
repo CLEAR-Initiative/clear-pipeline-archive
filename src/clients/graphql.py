@@ -860,6 +860,12 @@ mutation UpsertTranslations($input: UpsertTranslationsInput!) {
 }
 """
 
+GET_ENTITIES_MISSING_TRANSLATION = """
+query EntitiesMissingTranslation($entityType: String!, $locale: String!) {
+  entitiesMissingTranslation(entityType: $entityType, locale: $locale)
+}
+"""
+
 
 def get_translations(entity_type: str, entity_id: str) -> list[dict]:
     """Fetch every translation row currently stored for the entity.
@@ -871,6 +877,24 @@ def get_translations(entity_type: str, entity_id: str) -> list[dict]:
         {"entityType": entity_type, "entityId": entity_id},
     )
     return result.get("translations") or []
+
+
+def get_entities_missing_translation(
+    entity_type: str,
+    locale: str,
+) -> list[str]:
+    """IDs of entities (of `entity_type`) that have no translation row
+    for `locale`. Lets the backfill driver dispatch only entities the
+    worker would actually translate, skipping the noisy "all current"
+    path inside translate_and_upsert. Stale rows (row exists with
+    out-of-date hashes) are NOT returned — they're rare and handled
+    by per-entity enrichment hooks.
+    """
+    result = _execute(
+        GET_ENTITIES_MISSING_TRANSLATION,
+        {"entityType": entity_type, "locale": locale},
+    )
+    return result.get("entitiesMissingTranslation") or []
 
 
 def upsert_translations(
