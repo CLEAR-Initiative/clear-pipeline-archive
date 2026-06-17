@@ -46,6 +46,20 @@ app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # Broker resilience. Hosted Redis (Render, Upstash) periodically
+    # drops idle connections; the default config raises ConnectionError
+    # straight out of the consumer loop and the worker dies until a
+    # human restarts it (observed 2026-06-17). These knobs let kombu
+    # retry on startup AND mid-run with exponential backoff, heartbeat
+    # the connection so a half-open socket is detected before it's
+    # used, and cancel any task that was in flight when the connection
+    # dropped so it gets redelivered to a healthy consumer instead of
+    # ack'd into the void.
+    broker_connection_retry=True,
+    broker_connection_retry_on_startup=True,
+    broker_connection_max_retries=None,
+    broker_heartbeat=30,
+    worker_cancel_long_running_tasks_on_connection_loss=True,
 )
 
 app.conf.beat_schedule = {

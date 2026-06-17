@@ -51,13 +51,15 @@ logger = logging.getLogger(__name__)
 
 
 def _iter_locations(limit: int | None) -> list[dict]:
-    """All admin locations levels 0-2 (the user-facing ones — landmark L4
-    points get auto-generated names that aren't worth translating). Level
-    decides the iteration order: we backfill country, then state, then
-    district, which produces useful translations earliest for
-    coarse-grained views."""
+    """Every admin location at every level the API exposes. Iterates
+    coarsest-first (country → state → district → sub-district → landmark)
+    so user-facing translations appear earliest for coarse-grained views
+    while a long backfill drains; L3/L4 still get translated because the
+    lazy-on-read loader keeps re-enqueueing them otherwise (every
+    /detection list view references locations at every level via event
+    associations)."""
     rows: list[dict] = []
-    for level in (0, 1, 2):
+    for level in (0, 1, 2, 3, 4):
         for loc in graphql.get_locations_by_level(level):
             rows.append({"id": loc["id"], "name": loc.get("name")})
             if limit is not None and len(rows) >= limit:
@@ -159,6 +161,26 @@ def main() -> None:
     rows = iterator(args.limit)
     total = len(rows)
     logger.info("Found %d %s row(s) to process.", total, args.entity_type)
+
+    # Prune entities that already have rows for every target locale.
+    # Without this, the worker would still run translate_and_upsert on
+    # each one, immediately hit the staleness diff, log "all current",
+    # and return — pure broker + DB-read overhead. Union the per-locale
+    # missing sets so an entity with `ar` but missing `fr` still gets
+    # through.
+    missing_union: set[str] = set()
+    for locale in target_locales:
+        missing_union.update(
+            graphql.get_entities_missing_translation(args.entity_type, locale)
+        )
+    pre_filter_total = total
+    rows = [r for r in rows if r["id"] in missing_union]
+    skipped_by_filter = pre_filter_total - len(rows)
+    logger.info(
+        "Pre-filter: %d %s row(s) already covered for all target locale(s) — %d remain.",
+        skipped_by_filter, args.entity_type, len(rows),
+    )
+    total = len(rows)
 
     if args.dry_run:
         logger.info("[DRY-RUN] First 5 ids: %s", [r["id"] for r in rows[:5]])

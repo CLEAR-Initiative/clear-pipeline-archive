@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 LOCALE_LABELS: dict[str, str] = {
     "ar": "Arabic (Modern Standard, MSA)",
     "fr": "French",
-    "fa": "Persian (Dari)",
-    "ps": "Pashto",
 }
 
 TRANSLATION_PROMPT_VERSION = "v1"
