@@ -5,7 +5,7 @@ import re
 
 from src.clients.graphql import create_signal, find_or_create_landmark_l4
 from src.models.dataminr import DataminrSignal
-from src.services.geoparser import GeoparseResult, geoparse_signal
+from src.services.geoparser import GeoparseResult, extract_top_candidate, geoparse_signal
 from src.services.location import resolve_signal_location
 
 logger = logging.getLogger(__name__)
@@ -278,6 +278,17 @@ def enrich_with_geoparser(
         # importance floor) at INFO — look for the adjacent `[geoparser] ...`
         # line in the log to see which gate fired.
         logger.info("[%s] Geoparser produced no result — falling back to source coords", log_tag)
+        # We still ran the extraction stages even when Nominatim failed
+        # the resolution. Pass the unresolved candidate name to clear-api
+        # so the L4 row created from source coords gets a meaningful
+        # label ("al-Obeid (unresolved)") instead of falling through to
+        # the signal title — Dataminr titles in particular are full
+        # paragraphs and pollute the locations table. When no candidate
+        # is extractable at all, clear-api's coord-based fallback kicks
+        # in ("Point 15.6280, 30.2156").
+        unresolved = extract_top_candidate(title, geoparser_body)
+        if unresolved:
+            input_data["pointName"] = f"{unresolved} (unresolved)"
         return None
 
     input_data["geoparsedData"] = geoparse_to_dict(geo_result)

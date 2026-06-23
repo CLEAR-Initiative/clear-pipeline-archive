@@ -137,24 +137,43 @@ DISQUALIFYING_PHRASES: frozenset[str] = frozenset(
 # miss a candidate than to ship a candidate that's a person's name or an
 # organisation. The patterns each emit (name, position) pairs.
 
+# Arabic definite-article prefixes commonly seen in Sudanese / pan-Arab
+# transliteration. `[Aa]l`, `[Ee]l`, etc. each match either case at the
+# leading letter so we capture both "al-Obeid" (Dataminr-style) and
+# "Al-Obeid" (when the source headline-cased the article). The separator
+# is "-" or whitespace ("al-Nahud", "Al Nahud" both match). Without this
+# allowance, the regex below requires an uppercase first letter and ends
+# up capturing the post-prefix fragment alone ("Obeid", "Nahud") which
+# never matches Nominatim.
+_ARTICLE = (
+    r"(?:[Aa]l|[Ee]l|[Aa]s|[Aa]n|[Aa]sh|[Aa]d|[Aa]t|[Aa]r|[Aa]z|[Ii]l)[- ]"
+)
+
+# Each token of the captured name: optional Arabic article + uppercase
+# letter + word characters / hyphens / apostrophes. Reused below so both
+# the prep pattern and the comma pattern stay symmetric.
+_NAME_TOKEN = rf"(?:{_ARTICLE})?[A-Z][\w\-']*"
+
 # Place names appearing after location-indicating prepositions:
 #   "explosion in Al Fasher, Sudan"  →  "Al Fasher"
 #   "near Markib"                    →  "Markib"
 #   "drone strike on Nyala Airport"  →  "Nyala Airport"
+#   "around al-Obeid, Sudan"         →  "al-Obeid"
 # "on" is included because attack-style headlines and liveBrief text routinely
 # use "strike/attack ON <place>". Days-of-week + months are filtered as
 # stopwords above so "on Monday" / "on May 19" don't produce candidates.
 _PREP_PATTERN = re.compile(
     r"\b(in|at|near|around|outside|on)\s+"
-    r"((?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4})",
+    rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,4}})",
 )
 
 # Comma-separated hierarchical patterns:
 #   "Al Fasher, North Darfur, Sudan"  →  emits "Al Fasher" (deepest part)
+#   "al-Obeid, Sudan"                 →  emits "al-Obeid"
 # Multi-segment splits handled later by re-running the matcher recursively.
 _COMMA_PATTERN = re.compile(
-    r"\b((?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4}),\s+"
-    r"(?:[A-Z][\w\-']*)(?:\s+[A-Z][\w\-']*){0,4},?",
+    rf"\b({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,4}}),\s+"
+    rf"{_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,4}},?",
 )
 
 
@@ -370,7 +389,90 @@ def _extract_country_code(nominatim_result: dict) -> str | None:
     return code.lower() if isinstance(code, str) else None
 
 
+# ─── Transliteration-tolerant Nominatim queries ───────────────────────────
+
+
+# Captures Arabic article + separator + the rest of the token, used to
+# generate alternate transliterations of the same place name (e.g.
+# "al-Obeid" → "Al Obeid" → "El Obeid" → "Obeid"). Mirrors `_ARTICLE`
+# above; kept here so the extraction layer and the query layer share a
+# single allow-list.
+_ARTICLE_HEAD_RE = re.compile(
+    r"^([Aa]l|[Ee]l|[Aa]s|[Aa]n|[Aa]sh|[Aa]d|[Aa]t|[Aa]r|[Aa]z|[Ii]l)[- ](.+)$"
+)
+
+
+def _query_variants(name: str) -> list[str]:
+    """Generate ordered Nominatim query variants for a candidate name.
+
+    Sudanese / pan-Arab place names appear in OSM under multiple
+    transliterations — "al-Obeid" is more commonly indexed as "El Obeid"
+    or "Al Ubayyid". Trying the original first then fanning out into
+    space-separated and El/Al variants raises the true-positive rate
+    without changing the disqualification semantics; the stripped form
+    is tried last so we degrade to the pre-fix behaviour rather than
+    miss entirely.
+
+    Each call adds at most ~3 extra Nominatim queries. Cached on the
+    second occurrence; benign as a one-shot lookup cost otherwise.
+    """
+    variants: list[str] = [name]
+
+    m = _ARTICLE_HEAD_RE.match(name)
+    if m:
+        article_raw, rest = m.group(1), m.group(2)
+        # Normalise: capitalise the article and use a space separator.
+        cap_article = article_raw.capitalize()
+        variants.append(f"{cap_article} {rest}")
+        # Swap Al/El — both transliterate ‫الـ‬ depending on convention.
+        if cap_article == "Al":
+            variants.append(f"El {rest}")
+        elif cap_article == "El":
+            variants.append(f"Al {rest}")
+        # Last resort: drop the article entirely (current pre-fix
+        # behaviour). Keeps backward compatibility for names that only
+        # match Nominatim under the bare form.
+        variants.append(rest)
+
+    # Dedupe while preserving order.
+    return list(dict.fromkeys(variants))
+
+
 # ─── Public entry point ───────────────────────────────────────────────────
+
+
+def extract_top_candidate(
+    title: str | None,
+    description: str | None = None,
+) -> str | None:
+    """Run only the extraction + classification + disqualification +
+    ranking stages and return the top candidate's name.
+
+    Used by `geoparse_signal` internally; also exposed so the pipeline
+    can recover a sensible human label when the full geoparse fails (the
+    Nominatim lookup misses) — that label is then used as the L4
+    location's name instead of the signal title bleeding through.
+
+    Returns None when no usable candidate exists (no candidates
+    extracted, or the top is disqualified).
+    """
+    candidates: list[Candidate] = []
+    candidates.extend(_extract_from_text(title or "", "title"))
+    candidates.extend(_extract_from_text(description or "", "body"))
+
+    if not candidates:
+        return None
+
+    for c in candidates:
+        c.kind = "landmark" if _is_landmark(c.name) else "admin"
+        source_text = title if c.field == "title" else (description or "")
+        c.disqualified = _is_disqualified(c, source_text or "")
+
+    ranked = _rank(candidates)
+    top = ranked[0]
+    if top.disqualified:
+        return None
+    return top.name
 
 
 def geoparse_signal(
@@ -388,7 +490,10 @@ def geoparse_signal(
       - Nominatim is unhealthy (circuit open) or unreachable
 
     The caller is expected to handle None as "no geoparser enrichment" and
-    fall back to whatever coord-based resolution it does today.
+    fall back to whatever coord-based resolution it does today. When that
+    coord-based fallback needs a human label for the resulting L4
+    location, call `extract_top_candidate(title, description)` separately
+    — the extraction stages succeed even when Nominatim doesn't.
     """
     expected = expected_country_codes or {"sd"}
 
@@ -419,21 +524,35 @@ def geoparse_signal(
         logger.info("[geoparser] top candidate %r is disqualified — bailing", top.name)
         return None
 
-    # Resolve the top candidate via Nominatim
+    # Resolve the top candidate via Nominatim, trying transliteration
+    # variants. Variants are dedup'd and returned in priority order; the
+    # first one with a usable result wins.
     country_codes_param = ",".join(sorted(expected))
-    results = nominatim.search(top.name, country_codes=country_codes_param, limit=5)
-    if not results:
-        logger.info("[geoparser] nominatim returned no usable result for %r", top.name)
-        return None
+    variants = _query_variants(top.name)
+    best: dict | None = None
+    matched_variant: str | None = None
+    for variant in variants:
+        results = nominatim.search(variant, country_codes=country_codes_param, limit=5)
+        if not results:
+            continue
+        candidate_best = _pick_best_nominatim_result(results, expected)
+        if candidate_best:
+            best = candidate_best
+            matched_variant = variant
+            break
 
-    best = _pick_best_nominatim_result(results, expected)
     if not best:
         logger.info(
-            "[geoparser] no nominatim result cleared class/country filter for %r "
-            "(rejected classes: %s)",
-            top.name, sorted(_REJECTED_CLASSES),
+            "[geoparser] nominatim returned no usable result for %r (tried %d variant(s): %r)",
+            top.name, len(variants), variants,
         )
         return None
+
+    if matched_variant and matched_variant != top.name:
+        logger.info(
+            "[geoparser] matched %r via transliteration variant %r",
+            top.name, matched_variant,
+        )
 
     try:
         lat = float(best["lat"])
