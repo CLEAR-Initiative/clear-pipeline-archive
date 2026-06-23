@@ -80,6 +80,32 @@ class TestExtraction:
         khartoum = [c for c in candidates if c.name == "Khartoum"]
         assert len(khartoum) == 1
 
+    def test_arabic_article_prefix_preserved_after_preposition(self):
+        # Regression for the Sudanese-name bug: "al-Obeid" used to be
+        # captured as "Obeid" because the regex required an uppercase
+        # first letter. After the fix the article is part of the name so
+        # Nominatim's "al-Obeid" / "El Obeid" / "Al Ubayyid" entries can
+        # all be tried as variants.
+        candidates = gp._extract_from_text(
+            "Civilians around al-Obeid, Sudan", "title",
+        )
+        names = {c.name for c in candidates}
+        assert "al-Obeid" in names
+        assert "Obeid" not in names  # bare-fragment capture must not survive
+
+    def test_arabic_article_prefix_preserved_in_comma_pattern(self):
+        # Same fix, comma-led pattern.
+        candidates = gp._extract_from_text(
+            "Heavy fighting in al-Nahud, Sudan", "title",
+        )
+        names = {c.name for c in candidates}
+        assert "al-Nahud" in names
+
+    def test_arabic_article_capitalised_form_still_works(self):
+        # Existing capitalisation conventions must keep matching.
+        candidates = gp._extract_from_text("explosion in Al Fasher", "title")
+        assert any(c.name == "Al Fasher" for c in candidates)
+
 
 # ─── Classification ───────────────────────────────────────────────────────
 
@@ -356,3 +382,71 @@ class TestGeoparseSignal:
         assert kwargs.get("country_codes") == "ng"
         assert result is not None
         assert result.country_code == "ng"
+
+
+# ─── Transliteration variants ─────────────────────────────────────────────
+
+
+class TestQueryVariants:
+    """Sudanese / pan-Arab place names are transliterated multiple ways
+    in OSM. `_query_variants` fans the captured form out into a small
+    ordered set so the first matching transliteration wins."""
+
+    def test_al_dash_form_expands(self):
+        variants = gp._query_variants("al-Obeid")
+        # Original first, capitalised+space next, El swap, stripped last.
+        assert variants[0] == "al-Obeid"
+        assert "Al Obeid" in variants
+        assert "El Obeid" in variants
+        assert variants[-1] == "Obeid"
+
+    def test_el_dash_form_expands_with_al_swap(self):
+        variants = gp._query_variants("El-Geneina")
+        assert variants[0] == "El-Geneina"
+        assert "El Geneina" in variants
+        assert "Al Geneina" in variants
+
+    def test_no_article_returns_only_original(self):
+        # Plain place names don't need expansion.
+        assert gp._query_variants("Khartoum") == ["Khartoum"]
+        assert gp._query_variants("Nyala Airport") == ["Nyala Airport"]
+
+    def test_dedupes_within_output(self):
+        # Edge case: any internal collapse must preserve order without
+        # duplicates so the loop in geoparse_signal doesn't double-query
+        # Nominatim for the same string.
+        out = gp._query_variants("al-Obeid")
+        assert len(out) == len(set(out))
+
+
+# ─── Top-candidate extraction (for unresolved-name fallback) ──────────────
+
+
+class TestExtractTopCandidate:
+    """`extract_top_candidate` runs only extraction + classification +
+    rank + disqualify and returns the top name. Used by the pipeline to
+    label L4 rows it creates when geoparse_signal misses (Nominatim
+    failure) — instead of letting the signal title bleed through."""
+
+    def test_returns_top_extracted_name(self):
+        # Same path geoparse_signal takes; we just expose it without
+        # making the Nominatim call.
+        assert gp.extract_top_candidate("Civilians around al-Obeid, Sudan") == "al-Obeid"
+
+    def test_returns_none_for_text_with_no_places(self):
+        assert gp.extract_top_candidate("the situation worsened today") is None
+        assert gp.extract_top_candidate("") is None
+        assert gp.extract_top_candidate(None) is None
+
+    def test_returns_none_when_top_is_disqualified(self):
+        # "transferred to Khartoum" — the only candidate gets disqualified
+        # by the preceding-phrase check. No fallback to a worse candidate.
+        assert gp.extract_top_candidate("Wounded transferred to Khartoum") is None
+
+    def test_landmark_wins_over_admin_when_both_present(self):
+        # Mirrors the ranking layer's tier priority: landmark in body
+        # beats admin in title even though admin scored higher on field
+        # weight before tiering.
+        title = "Reports in Nyala"
+        body = "Strike at Nyala Airport confirmed"
+        assert gp.extract_top_candidate(title, body) == "Nyala Airport"
