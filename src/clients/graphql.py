@@ -775,3 +775,150 @@ def find_or_create_landmark_l4(
         payload["sourceLng"] = source_lng
     result = _execute(FIND_OR_CREATE_LANDMARK_L4, {"input": payload})
     return result["findOrCreateLandmarkL4"]
+
+
+GET_CRISIS_CANONICAL = """
+query CrisisCanonical($id: String!) {
+  crisis(id: $id) {
+    id
+    title
+    summary
+    scenarios
+    needs
+  }
+}
+"""
+
+GET_EVENT_CANONICAL = """
+query EventCanonical($id: String!) {
+  event(id: $id) {
+    id
+    title
+    description
+  }
+}
+"""
+
+GET_LOCATION_CANONICAL = """
+query LocationCanonical($id: String!) {
+  location(id: $id) {
+    id
+    name
+  }
+}
+"""
+
+
+def get_crisis_canonical(crisis_id: str) -> dict | None:
+    """Fetch only the four translatable fields of a crisis. Used by the
+    translation step in tasks/crisis.py to feed Claude the current
+    canonical English text after all in-task writes have committed.
+
+    Relies on the pipeline user's language being 'en' so the resolver
+    overlay short-circuits and returns canonical values — if that ever
+    changes, swap to an explicit `Accept-Language: en` header in
+    `_execute`.
+    """
+    result = _execute(GET_CRISIS_CANONICAL, {"id": crisis_id})
+    return result.get("crisis")
+
+
+def get_event_canonical(event_id: str) -> dict | None:
+    """Fetch the two translatable fields of an event (title,
+    description). Same pipeline-language invariant as
+    get_crisis_canonical above."""
+    result = _execute(GET_EVENT_CANONICAL, {"id": event_id})
+    return result.get("event")
+
+
+def get_location_canonical(location_id: str) -> dict | None:
+    """Fetch the one translatable field of a location (name). Same
+    pipeline-language invariant as get_crisis_canonical above."""
+    result = _execute(GET_LOCATION_CANONICAL, {"id": location_id})
+    return result.get("location")
+
+
+# ─── Translations ─────────────────────────────────────────────────────────────
+
+GET_TRANSLATIONS = """
+query Translations($entityType: String!, $entityId: String!) {
+  translations(entityType: $entityType, entityId: $entityId) {
+    locale
+    data
+    sourceHashes
+  }
+}
+"""
+
+UPSERT_TRANSLATIONS = """
+mutation UpsertTranslations($input: UpsertTranslationsInput!) {
+  upsertTranslations(input: $input) {
+    entityType
+    entityId
+    locales
+  }
+}
+"""
+
+GET_ENTITIES_MISSING_TRANSLATION = """
+query EntitiesMissingTranslation($entityType: String!, $locale: String!) {
+  entitiesMissingTranslation(entityType: $entityType, locale: $locale)
+}
+"""
+
+
+def get_translations(entity_type: str, entity_id: str) -> list[dict]:
+    """Fetch every translation row currently stored for the entity.
+    Returns an empty list when nothing has been written yet (cold start).
+    Admin/pipeline auth required at the API.
+    """
+    result = _execute(
+        GET_TRANSLATIONS,
+        {"entityType": entity_type, "entityId": entity_id},
+    )
+    return result.get("translations") or []
+
+
+def get_entities_missing_translation(
+    entity_type: str,
+    locale: str,
+) -> list[str]:
+    """IDs of entities (of `entity_type`) that have no translation row
+    for `locale`. Lets the backfill driver dispatch only entities the
+    worker would actually translate, skipping the noisy "all current"
+    path inside translate_and_upsert. Stale rows (row exists with
+    out-of-date hashes) are NOT returned — they're rare and handled
+    by per-entity enrichment hooks.
+    """
+    result = _execute(
+        GET_ENTITIES_MISSING_TRANSLATION,
+        {"entityType": entity_type, "locale": locale},
+    )
+    return result.get("entitiesMissingTranslation") or []
+
+
+def upsert_translations(
+    entity_type: str,
+    entity_id: str,
+    translations: list[dict],
+) -> dict:
+    """Write/replace per-locale translation rows. Each entry in
+    `translations` must shape as:
+        {"locale": "ar", "data": {...}, "sourceHashes": {field: "sha256:..."}}
+
+    Mirrors clear-api's UpsertTranslationsInput exactly. The mutation
+    runs the per-locale upserts in a single DB transaction so a partial
+    failure can't leave the entity with some locales written and others
+    missing.
+    """
+    result = _execute(
+        UPSERT_TRANSLATIONS,
+        {
+            "input": {
+                "entityType": entity_type,
+                "entityId": entity_id,
+                "translations": translations,
+            }
+        },
+    )
+    return result["upsertTranslations"]

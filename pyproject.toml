@@ -28,6 +28,16 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.9",
 ]
+# Optional extra used only by scripts/eval_translations.py — keeps the
+# main pipeline image lean (no OpenAI / Gemini / Notion SDKs in prod).
+# Install with:  uv pip install -e ".[eval]"
+# notion-client >=2.4 ships data_sources support, which Notion's 2025-09
+# API requires (older clients silently no-op schema writes).
+eval = [
+    "openai>=1.50",
+    "google-genai>=1.0",
+    "notion-client>=2.4",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

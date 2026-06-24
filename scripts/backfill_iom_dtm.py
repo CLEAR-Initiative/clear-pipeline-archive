@@ -9,12 +9,19 @@ on clear-api. Writes are bulk — one network call per admin level.
 Runs synchronously in-process — no Celery worker required.
 
 Usage:
-    python scripts/backfill_iom_dtm.py                      # all 3 levels
+    python scripts/backfill_iom_dtm.py                      # all 3 levels (default country)
     python scripts/backfill_iom_dtm.py --levels 1,2         # skip country
     python scripts/backfill_iom_dtm.py --levels 2           # districts only
     python scripts/backfill_iom_dtm.py --dry-run            # fetch, match, print — no writes
     python scripts/backfill_iom_dtm.py --country "Sudan"
     python scripts/backfill_iom_dtm.py --admin0-pcode SDN
+
+    # Afghanistan — there's no canonical AFG operation in the DTM API,
+    # so override the operation default to "" to fetch across all operations.
+    python scripts/backfill_iom_dtm.py --iso3 AFG --operation ""
+
+    # --iso3 is a shortcut that sets --country and --admin0-pcode together;
+    # either explicit flag still wins if you also pass it.
 """
 
 import argparse
@@ -30,6 +37,15 @@ from src.clients import graphql, iom_dtm  # noqa: E402
 from src.config import settings  # noqa: E402
 
 METADATA_TYPE = "iom_dtm_displacement"
+
+# --iso3 shortcut: maps to (DTM CountryName filter, DTM Admin0Pcode filter).
+# The DTM API treats these as independent filters but in practice they have
+# to agree, so we set both from one flag for ergonomics. Either flag can
+# still be overridden explicitly on the command line.
+ISO3_TO_DTM_FILTERS: dict[str, tuple[str, str]] = {
+    "SDN": ("Sudan", "SDN"),
+    "AFG": ("Afghanistan", "AFG"),
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -297,14 +313,29 @@ def run(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill IOM DTM displacement into locationMetadata.")
     parser.add_argument(
+        "--iso3",
+        default=None,
+        help=(
+            "Country shortcut — sets --country and --admin0-pcode together. "
+            f"Supported: {sorted(ISO3_TO_DTM_FILTERS)}. Explicit --country / "
+            "--admin0-pcode flags still win if also supplied."
+        ),
+    )
+    parser.add_argument(
         "--country",
-        default=settings.iom_dtm_country_name,
-        help=f"CountryName query filter (default: {settings.iom_dtm_country_name}).",
+        default=None,
+        help=(
+            "CountryName query filter. If omitted, derived from --iso3 (or "
+            f"settings.iom_dtm_country_name = {settings.iom_dtm_country_name!r})."
+        ),
     )
     parser.add_argument(
         "--admin0-pcode",
-        default=settings.iom_dtm_admin0_pcode,
-        help=f"Admin0Pcode filter (default: {settings.iom_dtm_admin0_pcode}).",
+        default=None,
+        help=(
+            "Admin0Pcode filter. If omitted, derived from --iso3 (or "
+            f"settings.iom_dtm_admin0_pcode = {settings.iom_dtm_admin0_pcode!r})."
+        ),
     )
     parser.add_argument(
         "--operation",
@@ -345,6 +376,23 @@ def main() -> None:
     args = parser.parse_args()
 
     levels = parse_levels(args.levels)
+
+    # Precedence: explicit --country / --admin0-pcode > --iso3 > settings.*.
+    iso3_country: str | None = None
+    iso3_admin0: str | None = None
+    if args.iso3:
+        iso3 = args.iso3.upper()
+        mapping = ISO3_TO_DTM_FILTERS.get(iso3)
+        if not mapping:
+            raise SystemExit(
+                f"--iso3 {iso3!r} is not recognised. Add it to "
+                f"ISO3_TO_DTM_FILTERS or pass --country and --admin0-pcode "
+                "directly."
+            )
+        iso3_country, iso3_admin0 = mapping
+    country = args.country or iso3_country or settings.iom_dtm_country_name
+    admin0_pcode = args.admin0_pcode or iso3_admin0 or settings.iom_dtm_admin0_pcode
+
     operation = args.operation or None
     from_round = args.from_round if args.from_round and args.from_round > 0 else None
     # "" → None (filter disabled); "BA" → "BA"; "BA,FM" → ["BA", "FM"] (priority fallback)
@@ -362,10 +410,10 @@ def main() -> None:
 
     logger.info(
         "Starting IOM DTM backfill: country=%s admin0=%s operation=%r from_round=%s assessment=%s levels=%s dry_run=%s",
-        args.country, args.admin0_pcode, operation, from_round, assessment_type, levels, args.dry_run,
+        country, admin0_pcode, operation, from_round, assessment_type, levels, args.dry_run,
     )
 
-    stats = run(levels, args.country, args.admin0_pcode, operation, from_round, assessment_type, args.dry_run)
+    stats = run(levels, country, admin0_pcode, operation, from_round, assessment_type, args.dry_run)
     logger.info("Done: %s", json.dumps(stats, indent=2))
 
 

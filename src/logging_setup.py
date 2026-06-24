@@ -116,6 +116,13 @@ def setup_logging() -> None:
                     ],
                     before_send=_scrub_event,
                 )
+                # Forward broker-disconnect WARNINGs to Sentry as ERROR events.
+                # The Celery consumer logger is where the "Connection to broker
+                # lost" message is emitted; attach the handler there so we
+                # don't double-process every WARNING in the app.
+                consumer_logger = logging.getLogger("celery.worker.consumer.consumer")
+                consumer_logger.addHandler(_BrokerDisconnectForwarder())
+
                 root.info("[LOGGING] Sentry initialised (env=%s)", settings.sentry_env)
             except Exception as e:
                 root.warning("[LOGGING] Failed to initialise Sentry: %s", e)
@@ -139,3 +146,38 @@ def _scrub_event(event, hint):
         for key in ("authorization", "cookie", "x-api-key"):
             headers.pop(key, None)
     return event
+
+
+class _BrokerDisconnectForwarder(logging.Handler):
+    """Forward Celery broker-disconnect warnings to Sentry as errors.
+
+    Celery logs `"Connection to broker lost"` at WARNING when the consumer
+    drops its Redis connection. The LoggingIntegration above only captures
+    ERROR+ as events, so these slip through silently — yet they represent
+    a real outage (workers stop consuming tasks while Beat keeps dispatching).
+    Rather than lower the global event_level (which would also capture
+    every retry, deprecation, third-party noise), we narrowly forward this
+    specific class of message.
+
+    Wired up on the `celery.worker.consumer.consumer` logger in
+    setup_logging().
+    """
+
+    PATTERNS = (
+        "Connection to broker lost",
+        "Cannot connect to",
+    )
+
+    def emit(self, record):
+        try:
+            import sentry_sdk
+        except ImportError:
+            return
+        msg = record.getMessage()
+        if any(p in msg for p in self.PATTERNS):
+            # Include the exception info if the record carries one, otherwise
+            # send as a message so we still get a Sentry event.
+            if record.exc_info:
+                sentry_sdk.capture_exception(record.exc_info[1])
+            else:
+                sentry_sdk.capture_message(msg, level="error")
