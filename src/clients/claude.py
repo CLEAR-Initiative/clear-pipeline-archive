@@ -193,17 +193,42 @@ def call_claude(
             "cache_create_tokens": getattr(u, "cache_creation_input_tokens", None),
         }
 
+        # `stop_reason == "max_tokens"` means Claude stopped mid-output
+        # because the budget ran out. The text is then truncated mid-
+        # token, the JSON is unclosed, and `_extract_json` can't recover
+        # anything useful. Detect it explicitly so the failure message
+        # points at the right knob to turn (the caller's `max_tokens`)
+        # instead of pretending the model misbehaved.
+        stop_reason = getattr(response, "stop_reason", None)
+        truncated = stop_reason == "max_tokens"
+
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError:
-            extracted = _extract_json(raw_text)
-            if extracted:
-                try:
-                    parsed = json.loads(extracted)
-                except json.JSONDecodeError as e:
-                    parse_error = f"JSONDecodeError after extraction: {e}"
+            if truncated:
+                parse_error = (
+                    f"Response truncated by max_tokens={max_tokens} "
+                    f"(stop_reason=max_tokens). Raise max_tokens or shrink the prompt."
+                )
             else:
-                parse_error = "Could not extract valid JSON from response"
+                extracted = _extract_json(raw_text)
+                if extracted:
+                    try:
+                        parsed = json.loads(extracted)
+                    except json.JSONDecodeError as e:
+                        parse_error = f"JSONDecodeError after extraction: {e}"
+                else:
+                    parse_error = "Could not extract valid JSON from response"
+        if truncated and parsed is not None:
+            # We somehow got valid JSON despite a max_tokens stop — extremely
+            # unlikely but logging it so we'd notice if the heuristic ever
+            # misfires for a future model that emits trailing whitespace
+            # before terminating.
+            logger.warning(
+                "[CLAUDE] stop_reason=max_tokens but response parsed cleanly; "
+                "treating as success. Consider raising max_tokens (current=%d).",
+                max_tokens,
+            )
     except anthropic.RateLimitError as err:
         rate_limit_after = _retry_after_from_error(err)
         logger.warning(

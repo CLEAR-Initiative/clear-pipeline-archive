@@ -127,9 +127,15 @@ def translate_entity(
             prompt_version=TRANSLATION_PROMPT_VERSION,
             event_id=entity_id,
             # Translations of nested JSON (crisis.needs, crisis.scenarios)
-            # blow past the 1024 default — bump generously so we don't
-            # truncate mid-object.
-            max_tokens=4096,
+            # blow past the 1024 default. Sectoral needs analysis for a
+            # content-rich crisis is several KB of nested objects per
+            # locale, and non-Latin scripts (Arabic, Amharic) inflate the
+            # output-token count vs. English by ~1.5–2x — 4096 truncates
+            # mid-string for those, which surfaced as "Could not extract
+            # valid JSON". 16384 gives headroom for 2 locales × the
+            # heaviest crisis we currently emit; Sonnet 4.x accepts well
+            # past this if it ever needs to climb further.
+            max_tokens=16384,
         )
     except (anthropic.APIStatusError, ClaudeRateLimited):
         # Transient — let the Celery task reschedule.
