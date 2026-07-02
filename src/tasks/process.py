@@ -10,9 +10,12 @@ from src.clients.claude import ClaudeRateLimited, call_claude
 from src.clients.graphql import (
     GraphQLClientError,
     escalate_event,
+    find_or_create_landmark_l4,
     get_dataminr_source_id,
     get_disaster_types,
+    get_signal,
     update_signal_geoparsed_data,
+    update_signal_location,
     update_signal_severity,
 )
 from src.config import settings
@@ -320,13 +323,43 @@ def process_manual_signal(
             classification.severity,
         )
 
+        # ─── Fetch the signal state up front ─────────────────────────────────
+        # We need to know whether the user picked a location before the
+        # geoparser runs, so the geoparser stage can decide whether to
+        # promote its candidate into `signal.locationId` (falls back only
+        # when no user pick — see the geoparser stage below). The same
+        # `created_signal` handle also feeds event grouping after any
+        # promotion so grouping sees the up-to-date location.
+        try:
+            created_signal = get_signal(signal_id) or {}
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "[manual:%s] failed to fetch signal for grouping (falling back to isolated-event behaviour): %s",
+                signal_id, exc,
+            )
+            created_signal = {}
+
+        has_user_location = bool(
+            (created_signal.get("generalLocation") or {}).get("id")
+        )
+
         # ─── Geoparser enrichment ─────────────────────────────────────────────
         # Manual signals are created in clear-api before the pipeline runs, so
-        # the geoparser fires here as post-hoc enrichment. We only attach the
-        # structured result to signals.geoparsed_data — locationId stays as
-        # the user picked it (manual-signal flows trust the human-entered
-        # location). Best-effort: any failure logs and continues.
-        logger.info("[manual:%s] Running geoparser", signal_id)
+        # the geoparser fires here as post-hoc enrichment.
+        #
+        # Two effects when a candidate resolves:
+        #   1. Structured result → `signals.geoparsed_data` (always).
+        #   2. Promoted L4 → `signals.location_id` (ONLY when the user
+        #      didn't pick a location). This is the fix that stops
+        #      geoparser-resolvable signals from becoming isolated events
+        #      just because the human left the location blank.
+        # We deliberately do NOT override a user-picked location — the UI
+        # picker is the source of truth for manual signals; the geoparser is
+        # a fallback for the empty-picker case.
+        logger.info(
+            "[manual:%s] Running geoparser (user_location=%s)",
+            signal_id, has_user_location,
+        )
         try:
             geo_result = geoparse_signal(title, description)
             if geo_result is not None:
@@ -335,6 +368,40 @@ def process_manual_signal(
                     "[manual:%s] Geoparsed: candidate=%r kind=%s importance=%.2f",
                     signal_id, geo_result.candidate, geo_result.kind, geo_result.importance,
                 )
+                if not has_user_location:
+                    try:
+                        promo = find_or_create_landmark_l4(
+                            name=geo_result.candidate,
+                            lat=geo_result.lat,
+                            lng=geo_result.lng,
+                            kind=geo_result.kind,
+                        )
+                        if promo.get("locationId") and not promo.get("abortedReason"):
+                            update_signal_location(signal_id, promo["locationId"])
+                            # Re-fetch so `created_signal` sees the new
+                            # location before event grouping runs. Best-
+                            # effort: on lookup failure we fall through with
+                            # the pre-promotion snapshot (grouping still
+                            # gets the geoparser's raw data, just not the
+                            # newly-set location).
+                            refreshed = get_signal(signal_id)
+                            if refreshed:
+                                created_signal = refreshed
+                            logger.info(
+                                "[manual:%s] Promoted geoparser candidate to L4 %s → set as signal.locationId (reused=%s, point_type=%s)",
+                                signal_id, promo["locationId"],
+                                promo.get("reused"), promo.get("pointType"),
+                            )
+                        elif promo.get("abortedReason"):
+                            logger.info(
+                                "[manual:%s] L4 promotion aborted (%s) — signal stays unlocated",
+                                signal_id, promo["abortedReason"],
+                            )
+                    except Exception as exc:  # noqa: BLE001 — promotion best-effort
+                        logger.warning(
+                            "[manual:%s] L4 promotion failed: %s",
+                            signal_id, exc,
+                        )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning("[manual:%s] Geoparser enrichment failed: %s", signal_id, exc)
 
@@ -347,11 +414,11 @@ def process_manual_signal(
             update_signal_severity(signal_id, classification.severity)
 
         # ─── Stage 2: Event grouping ──────────────────────────────────────────
-        # Manual signals don't carry a created_signal record with resolved
-        # locations yet (the manual-signal mutation handles creation API-side).
-        # v2 grouping will still work — admin-2 resolution returns None and
-        # the signal becomes its own event, which matches the pre-existing
-        # behaviour for manual entries.
+        # `created_signal` was fetched above (and refreshed after promotion,
+        # when the geoparser gave us a location the human didn't). Grouping
+        # walks `signal.generalLocation.ancestorIds` to find admin-2, so an
+        # L4 that resolves to a real A2 will now cluster instead of going
+        # isolated.
         from src.services.signal import extract_population_affected_from_text
         actual_pop = extract_population_affected_from_text(title, description)
 
@@ -363,7 +430,7 @@ def process_manual_signal(
             signal_origin_id=None,
             signal_timestamp=None,
             classification=classification,
-            created_signal={},
+            created_signal=created_signal,
             signal_actual_population_affected=actual_pop,
         )
 
