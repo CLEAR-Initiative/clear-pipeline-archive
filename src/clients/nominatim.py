@@ -242,7 +242,15 @@ def search(
     if cached is not None:
         if cached["status"] == "ok":
             return cached["responseJson"]
-        # 'no_result' or 'error' — cached negative
+        # 'no_result' or 'error' — cached negative. Log because a stale
+        # negative on a query LocationIQ would now happily answer is very
+        # hard to spot without this line — the caller just sees a None
+        # and assumes OSM has no coverage. TTLs: no_result ~30 days,
+        # error ~1 hour (see settings.geocoder_cache_ttl_*_seconds).
+        logger.info(
+            "[nominatim] cached negative short-circuit: query=%r status=%s (hash=%s)",
+            query, cached["status"], qhash[:8],
+        )
         return None
 
     # 2. Circuit breaker

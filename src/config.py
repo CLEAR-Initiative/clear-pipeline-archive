@@ -163,11 +163,17 @@ class Settings(BaseSettings):
 
     # Cache TTLs (seconds) per response status. Successful geocodes are
     # cached aggressively (~6 months) since place names rarely change.
-    # Empty results are cached for ~30 days — they might exist later.
+    # Empty results are cached for ~7 days — they might exist later.
+    # Bumped down from 30 days after we discovered a burst of poisoned
+    # `no_result` writes during a bad-config window (May 25 – June 9, 2026)
+    # blocked ~2 weeks of Sudanese geocoding lookups. 7 days keeps the cache
+    # useful for repeat-question workloads (same signal-week still hits the
+    # cache) while ensuring transient upstream misbehaviour heals within a
+    # week instead of a month.
     # Errors are cached briefly so we don't hammer the geocoder while it's
     # degraded but also recover quickly when it comes back.
     geocoder_cache_ttl_ok_seconds: int = 6 * 30 * 24 * 60 * 60  # ~180 days
-    geocoder_cache_ttl_no_result_seconds: int = 30 * 24 * 60 * 60  # 30 days
+    geocoder_cache_ttl_no_result_seconds: int = 7 * 24 * 60 * 60  # 7 days
     geocoder_cache_ttl_error_seconds: int = 60 * 60  # 1 hour
 
     # Rate-limit floor (seconds between calls). LocationIQ free tier allows
