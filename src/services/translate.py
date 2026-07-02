@@ -20,9 +20,22 @@ import anthropic
 from src.clients import graphql
 from src.clients.claude import ClaudeRateLimited, call_claude
 from src.config import settings
+from src.services.redis_lock import redis_lock
 from src.services.translation_hash import compute_source_hashes, stale_fields
 
 logger = logging.getLogger(__name__)
+
+# Per-entity dedup lock — prevents the same (entity_type, entity_id) from
+# being translated in parallel by two workers. This happens because
+# `task_acks_late=True` + `worker_cancel_long_running_tasks_on_connection_loss`
+# can silently redeliver a message to a second worker while the first is
+# still deep inside a slow Claude call, and the SDK's `max_retries=5`
+# amplifies the wasted work into a 4-5 minute cascade on both workers.
+#
+# TTL covers the worst-case task duration (task time_limit ≈ 5 min) plus a
+# short buffer so a SIGKILL'd worker's stale lock expires naturally without
+# blocking the next enqueue for very long.
+_TRANSLATE_LOCK_TTL_SECONDS = 360  # 6 min
 
 # Built once per process — locale code → human-readable name used in the
 # Claude prompt so the model knows what to translate into. We use the
@@ -194,7 +207,44 @@ def translate_and_upsert(
     Returns a summary dict for logging, or None when there's nothing to
     do. Raises (ClaudeRateLimited / anthropic.APIStatusError) so the
     caller's retry path can fire.
+
+    Also: if another worker is already translating this (entity_type,
+    entity_id) — detected via a short-TTL Redis dedup lock — this call
+    returns None immediately without touching Claude, GraphQL, or the
+    stored hashes. That's what breaks the "both workers 2 and 3 are
+    running the same crisis" duplication cascade that shows up as
+    parallel exponential-backoff retries in the Anthropic SDK log
+    output.
     """
+    target_locales = configured_target_locales()
+    if not target_locales:
+        return None
+
+    lock_key = f"translate:{entity_type}:{entity_id}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_TRANSLATE_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[TRANSLATE] %s %s: another worker holds the lock — skipping "
+                "(caller can re-enqueue if the peer's attempt fails)",
+                entity_type, entity_id,
+            )
+            return None
+        return _translate_and_upsert_locked(entity_type, entity_id, canonical)
+
+
+def _translate_and_upsert_locked(
+    entity_type: str,
+    entity_id: str,
+    canonical: dict[str, Any],
+) -> dict | None:
+    """Body of `translate_and_upsert`, invoked while holding the per-entity
+    dedup lock. Splitting the function this way keeps the lock scope
+    obvious to readers and avoids nesting the (already long) core logic
+    inside a `with` block."""
     target_locales = configured_target_locales()
     if not target_locales:
         return None

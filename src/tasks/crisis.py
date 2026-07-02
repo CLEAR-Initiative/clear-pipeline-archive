@@ -38,9 +38,19 @@ from src.prompts.crisis import (
     build_scenarios_prompt,
 )
 from src.services.population import estimate_population_for_districts
+from src.services.redis_lock import redis_lock
 from src.services.translate import translate_and_upsert
 
 logger = logging.getLogger(__name__)
+
+# Per-crisis dedup lock TTL. Enrichment fires several Claude calls
+# (narrative + scenarios + needs) sequentially — total wall-clock can run
+# 2-5 min under slow-Claude conditions. If a broker heartbeat drops while
+# a task is in flight, Celery redelivers the message to a second worker;
+# without dedup, both would re-run every Claude call and both would
+# rewrite the same fields, wasting API quota. TTL covers the 5-min hard
+# time_limit plus buffer for a SIGKILL'd worker to clean up.
+_CRISIS_LOCK_TTL_SECONDS = 360  # 6 min
 
 
 def _geometry_is_areal(geometry: dict | None) -> bool:
@@ -274,6 +284,8 @@ def _translate_crisis(crisis_id: str) -> dict | None:
     bind=True,
     max_retries=2,
     acks_late=True,
+    soft_time_limit=240,
+    time_limit=300,
 )
 def enrich_crisis(
     self,
@@ -288,6 +300,37 @@ def enrich_crisis(
         crisis_id, len(event_ids), len(district_ids), generate_narrative,
     )
 
+    # Per-crisis dedup — key on crisis_id so a redelivered message can't
+    # trigger a parallel copy of the (narrative + scenarios + needs +
+    # translate) sequence.
+    lock_key = f"enrich_crisis:{crisis_id}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_CRISIS_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[CRISIS] crisis=%s already being enriched — skipping duplicate delivery",
+                crisis_id,
+            )
+            return {"crisis_id": crisis_id, "skipped": True}
+        return _enrich_crisis_locked(
+            self, crisis_id, event_ids, district_ids, generate_narrative,
+        )
+
+
+def _enrich_crisis_locked(
+    self,
+    crisis_id: str,
+    event_ids: list[str],
+    district_ids: list[str],
+    generate_narrative: bool,
+) -> dict:
+    """Body of `enrich_crisis`, executed while holding the per-crisis dedup
+    lock. Original try / except structure (ClaudeRateLimited /
+    APIStatusError / Exception) preserved so Celery retry semantics on
+    transient errors are unchanged."""
     try:
         population_in_area = _compute_population_in_area(district_ids)
 

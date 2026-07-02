@@ -37,13 +37,20 @@ class ClaudeRateLimited(Exception):
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        # max_retries=5 (default is 2) — the SDK handles 429 + 5xx with
-        # exponential backoff per attempt. This absorbs most transient spikes
-        # before we ever see them at the call site.
+        # Keep the SDK default of max_retries=2. Previously we bumped this
+        # to 5 to absorb transient idle-connection drops during long
+        # `.create()` calls, but switching call_claude to `.stream()`
+        # (below) eliminates that failure mode — the connection stays
+        # warm via periodic events. Extra retries now just widen the
+        # window in which a duplicate delivery could pile on before the
+        # dedup lock catches it.
+        #
+        # timeout=600s (10 min) matches Anthropic's own guidance for
+        # long-running requests. Streaming makes this a per-idle-period
+        # ceiling in practice, so it very rarely fires.
         _client = anthropic.Anthropic(
             api_key=settings.anthropic_api_key,
-            max_retries=5,
-            timeout=60.0,
+            timeout=600.0,
         )
     return _client
 
@@ -177,13 +184,49 @@ def call_claude(
     usage_dict: dict[str, int | None] = {}
 
     try:
-        response = client.messages.create(
+        # Use streaming per Anthropic's guidance for long-running requests:
+        #   > Consider using the streaming Messages API [...] for long
+        #   > running requests, especially those over 10 minutes. Avoid
+        #   > setting a large max_tokens value without using the streaming
+        #   > Messages API [...] Some networks may drop idle connections
+        #   > after a variable period of time, which can cause the request
+        #   > to fail or timeout without receiving a response from
+        #   > Anthropic.
+        # For our translate stage (max_tokens=16384, 2 locales × 4 fields)
+        # the 60s idle-drop was reliably firing pre-fix and driving the
+        # SDK's max_retries=5 loop that showed up as a "Retrying request
+        # to /v1/messages in Xs" cascade on both workers processing the
+        # same crisis. `.stream()` keeps the connection warm via periodic
+        # events; `.get_final_message()` reassembles the full Message
+        # object at the end so the rest of this function (usage,
+        # stop_reason, content[0].text) sees exactly the same shape it
+        # got from `.create()`.
+        with client.messages.stream(
             model=chosen_model,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-        )
-        raw_text = response.content[0].text.strip()
+        ) as stream:
+            response = stream.get_final_message()
+
+        # Message.content is a list of ContentBlock variants — TextBlock
+        # (`.text`), ToolUseBlock (no `.text`), ThinkingBlock (`.thinking`,
+        # no `.text`), etc. Today's prompts always return a single
+        # TextBlock, but this call site is shared across every stage
+        # (classify, group, translate, needs, scenarios) and any future
+        # config change (extended thinking, tool use, multi-block
+        # responses) would silently break a `response.content[0].text`
+        # lookup:
+        #   - `content == []`     → IndexError
+        #   - `content[0]` is ThinkingBlock → AttributeError on `.text`
+        #   - multiple TextBlocks → only the first is read, tail is dropped
+        # `getattr(block, "text", "")` skips non-text blocks; the join
+        # concatenates any interleaved text (thinking blocks contribute
+        # empty strings). Safe on both today's shape and any of the
+        # above evolutions.
+        raw_text = "".join(
+            getattr(block, "text", "") for block in (response.content or [])
+        ).strip()
         # Translate Anthropic SDK usage names → insights API names
         u = response.usage
         usage_dict = {
