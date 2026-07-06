@@ -33,6 +33,13 @@ _CANONICAL_GETTERS = {
     name="src.tasks.translate.translate_entities_batch_task",
     bind=True,
     acks_late=True,
+    # Hard ceiling on wasted work when a Claude call spins in the SDK's
+    # exponential-backoff retry loop. Soft raises SoftTimeLimitExceeded
+    # into the task at 4 min; hard SIGKILLs at 5 min. The per-entity
+    # dedup lock in translate_and_upsert has a 6-min TTL so a killed
+    # worker's stale lock expires shortly after the SIGKILL.
+    soft_time_limit=240,
+    time_limit=300,
 )
 def translate_entities_batch_task(self, items: list[dict]) -> dict:
     """Translate a batch of entities in one task call.
@@ -122,6 +129,10 @@ def translate_entities_batch_task(self, items: list[dict]) -> dict:
     bind=True,
     max_retries=2,
     acks_late=True,
+    # Same rationale as translate_entities_batch_task — a single-entity
+    # task shouldn't spin longer than ~5 min through SDK retries.
+    soft_time_limit=240,
+    time_limit=300,
 )
 def translate_entity_task(self, entity_type: str, entity_id: str) -> dict | None:
     """Translate one entity by id. Fire-and-forget — caller doesn't

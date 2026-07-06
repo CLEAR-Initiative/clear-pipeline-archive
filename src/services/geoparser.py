@@ -531,20 +531,39 @@ def geoparse_signal(
     variants = _query_variants(top.name)
     best: dict | None = None
     matched_variant: str | None = None
+    # Per-variant tallies so the "no usable result" log distinguishes
+    # "Nominatim returned zero rows" from "Nominatim returned rows we
+    # filtered out". Without this, the two cases collapse into the same
+    # message and every failed lookup looks like an OSM data gap — even
+    # when the real cause is our class-filter (highway/railway/waterway).
+    per_variant_counts: list[tuple[str, int, int]] = []  # (variant, raw, kept)
     for variant in variants:
         results = nominatim.search(variant, country_codes=country_codes_param, limit=5)
+        raw = len(results or [])
         if not results:
+            per_variant_counts.append((variant, 0, 0))
             continue
         candidate_best = _pick_best_nominatim_result(results, expected)
+        # kept ≈ 1 if the picker returned anything post-filter, else 0.
+        # (`raw - kept` is the count filtered out — usually class-rejected.)
+        kept = 1 if candidate_best else 0
+        per_variant_counts.append((variant, raw, kept))
         if candidate_best:
             best = candidate_best
             matched_variant = variant
             break
 
     if not best:
+        # Format each variant as "name=raw→kept" so a caller can spot
+        # whether the miss was empty-response (raw=0) or filter-driven
+        # (raw>0, kept=0) at a glance.
+        summary = ", ".join(
+            f"{v}={r}→{k}" for (v, r, k) in per_variant_counts
+        )
         logger.info(
-            "[geoparser] nominatim returned no usable result for %r (tried %d variant(s): %r)",
-            top.name, len(variants), variants,
+            "[geoparser] nominatim returned no usable result for %r "
+            "(tried %d variant(s): %s)",
+            top.name, len(variants), summary,
         )
         return None
 

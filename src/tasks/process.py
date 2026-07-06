@@ -10,9 +10,12 @@ from src.clients.claude import ClaudeRateLimited, call_claude
 from src.clients.graphql import (
     GraphQLClientError,
     escalate_event,
+    find_or_create_landmark_l4,
     get_dataminr_source_id,
     get_disaster_types,
+    get_signal,
     update_signal_geoparsed_data,
+    update_signal_location,
     update_signal_severity,
 )
 from src.config import settings
@@ -27,11 +30,18 @@ from src.services.alert import is_stale_signal, maybe_escalate
 from src.services.event import dispatch_group_signal
 from src.services.local_classify import classify_locally
 from src.services.geoparser import geoparse_signal
+from src.services.redis_lock import redis_lock
 from src.services.signal import geoparse_to_dict, ingest_signal
 
 logger = logging.getLogger(__name__)
 
 _redis = redis.from_url(settings.redis_url, decode_responses=True)
+
+# Per-signal dedup lock TTL. Covers worst-case task duration (classify +
+# geoparser + grouping + optional escalation ≈ 3-4 min for slow Claude
+# calls) with a buffer for a SIGKILL'd worker to expire the lock cleanly
+# after the task's `time_limit`. If we bump these limits, bump this too.
+_SIGNAL_LOCK_TTL_SECONDS = 360  # 6 min
 
 # Cache data source ID and disaster types to avoid repeated lookups
 _source_id_cache: str | None = None
@@ -57,6 +67,13 @@ def _get_disaster_types() -> list[dict]:
     bind=True,
     max_retries=2,
     acks_late=True,
+    # Hard ceiling on wasted work when a Claude call spins in the SDK's
+    # retry loop. Combined with the per-signal dedup lock below, this
+    # stops the "same signal, both workers, both create an event"
+    # duplication pattern that broker heartbeat drops trigger under
+    # `task_acks_late=True` + `worker_cancel_long_running_tasks_on_connection_loss`.
+    soft_time_limit=240,
+    time_limit=300,
 )
 def process_signal(self, signal_data: dict):
     """
@@ -66,9 +83,38 @@ def process_signal(self, signal_data: dict):
     3. If relevant: group into event (new or existing)
     4. If high severity: assess for alert escalation
     """
+    signal = DataminrSignal.model_validate(signal_data)
+    source_id = _get_source_id()
+
+    # Per-signal dedup — key on Dataminr's stable alertId so a
+    # redelivered message can't start a parallel copy of this task.
+    # `wait_seconds=0` means "if a peer is already processing this
+    # signal, return immediately" — the peer will succeed or fail
+    # on its own; we don't need to pile on with duplicate Claude
+    # calls or duplicate event creation.
+    lock_key = f"signal:dataminr:{signal.alertId}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_SIGNAL_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[DATAMINR] alertId=%s already being processed — skipping duplicate delivery",
+                signal.alertId,
+            )
+            return {"alert_id": signal.alertId, "skipped": True}
+        return _process_signal_locked(self, signal, source_id, signal_data)
+
+
+def _process_signal_locked(self, signal: DataminrSignal, source_id: str, signal_data: dict):
+    """Body of `process_signal`, executed while holding the per-signal
+    dedup lock. Extracted so the lock scope is obvious to readers and the
+    (already long) core logic stays flat rather than nested inside a
+    `with` block. The original `try` / `except ClaudeRateLimited /
+    GraphQLClientError / Exception` structure is preserved here so Celery
+    retry semantics are unchanged."""
     try:
-        signal = DataminrSignal.model_validate(signal_data)
-        source_id = _get_source_id()
 
         # ─── Stage 1: Ingest signal ──────────────────────────────────────────
         created = ingest_signal(signal, source_id)
@@ -267,6 +313,8 @@ TRUSTED_SOURCE_NAMES = {"field_officer", "partner", "government"}
     bind=True,
     max_retries=2,
     acks_late=True,
+    soft_time_limit=240,
+    time_limit=300,
 )
 def process_manual_signal(
     self,
@@ -285,6 +333,42 @@ def process_manual_signal(
     3. If source is trusted (field_officer/partner/government): auto-escalate the event to alert
        and record the user escalation in eventEscaladedByUsers
     """
+    # Per-signal dedup — signal_id is the natural key. If a broker
+    # heartbeat drop redelivered the message while the first worker is
+    # still classifying / geoparsing / grouping, the second worker
+    # returns immediately instead of running the whole pipeline in
+    # parallel and creating a duplicate event.
+    lock_key = f"signal:manual:{signal_id}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_SIGNAL_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[MANUAL] signal_id=%s already being processed — skipping duplicate delivery",
+                signal_id,
+            )
+            return {"signal_id": signal_id, "skipped": True}
+        return _process_manual_signal_locked(
+            self, signal_id, source_type, title, description, severity, user_id, signal_published_at,
+        )
+
+
+def _process_manual_signal_locked(
+    self,
+    signal_id: str,
+    source_type: str,
+    title: str,
+    description: str,
+    severity: int | None,
+    user_id: str,
+    signal_published_at: str | None,
+):
+    """Body of `process_manual_signal`, executed while holding the
+    per-signal dedup lock. Original try / except structure preserved
+    below so Celery retry semantics on ClaudeRateLimited /
+    GraphQLClientError / unhandled exceptions are unchanged."""
     try:
         # ─── Stage 1: Classify ────────────────────────────────────────────────
         if settings.grouping_algo == "v2":
@@ -320,13 +404,43 @@ def process_manual_signal(
             classification.severity,
         )
 
+        # ─── Fetch the signal state up front ─────────────────────────────────
+        # We need to know whether the user picked a location before the
+        # geoparser runs, so the geoparser stage can decide whether to
+        # promote its candidate into `signal.locationId` (falls back only
+        # when no user pick — see the geoparser stage below). The same
+        # `created_signal` handle also feeds event grouping after any
+        # promotion so grouping sees the up-to-date location.
+        try:
+            created_signal = get_signal(signal_id) or {}
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "[manual:%s] failed to fetch signal for grouping (falling back to isolated-event behaviour): %s",
+                signal_id, exc,
+            )
+            created_signal = {}
+
+        has_user_location = bool(
+            (created_signal.get("generalLocation") or {}).get("id")
+        )
+
         # ─── Geoparser enrichment ─────────────────────────────────────────────
         # Manual signals are created in clear-api before the pipeline runs, so
-        # the geoparser fires here as post-hoc enrichment. We only attach the
-        # structured result to signals.geoparsed_data — locationId stays as
-        # the user picked it (manual-signal flows trust the human-entered
-        # location). Best-effort: any failure logs and continues.
-        logger.info("[manual:%s] Running geoparser", signal_id)
+        # the geoparser fires here as post-hoc enrichment.
+        #
+        # Two effects when a candidate resolves:
+        #   1. Structured result → `signals.geoparsed_data` (always).
+        #   2. Promoted L4 → `signals.location_id` (ONLY when the user
+        #      didn't pick a location). This is the fix that stops
+        #      geoparser-resolvable signals from becoming isolated events
+        #      just because the human left the location blank.
+        # We deliberately do NOT override a user-picked location — the UI
+        # picker is the source of truth for manual signals; the geoparser is
+        # a fallback for the empty-picker case.
+        logger.info(
+            "[manual:%s] Running geoparser (user_location=%s)",
+            signal_id, has_user_location,
+        )
         try:
             geo_result = geoparse_signal(title, description)
             if geo_result is not None:
@@ -335,6 +449,40 @@ def process_manual_signal(
                     "[manual:%s] Geoparsed: candidate=%r kind=%s importance=%.2f",
                     signal_id, geo_result.candidate, geo_result.kind, geo_result.importance,
                 )
+                if not has_user_location:
+                    try:
+                        promo = find_or_create_landmark_l4(
+                            name=geo_result.candidate,
+                            lat=geo_result.lat,
+                            lng=geo_result.lng,
+                            kind=geo_result.kind,
+                        )
+                        if promo.get("locationId") and not promo.get("abortedReason"):
+                            update_signal_location(signal_id, promo["locationId"])
+                            # Re-fetch so `created_signal` sees the new
+                            # location before event grouping runs. Best-
+                            # effort: on lookup failure we fall through with
+                            # the pre-promotion snapshot (grouping still
+                            # gets the geoparser's raw data, just not the
+                            # newly-set location).
+                            refreshed = get_signal(signal_id)
+                            if refreshed:
+                                created_signal = refreshed
+                            logger.info(
+                                "[manual:%s] Promoted geoparser candidate to L4 %s → set as signal.locationId (reused=%s, point_type=%s)",
+                                signal_id, promo["locationId"],
+                                promo.get("reused"), promo.get("pointType"),
+                            )
+                        elif promo.get("abortedReason"):
+                            logger.info(
+                                "[manual:%s] L4 promotion aborted (%s) — signal stays unlocated",
+                                signal_id, promo["abortedReason"],
+                            )
+                    except Exception as exc:  # noqa: BLE001 — promotion best-effort
+                        logger.warning(
+                            "[manual:%s] L4 promotion failed: %s",
+                            signal_id, exc,
+                        )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning("[manual:%s] Geoparser enrichment failed: %s", signal_id, exc)
 
@@ -347,11 +495,11 @@ def process_manual_signal(
             update_signal_severity(signal_id, classification.severity)
 
         # ─── Stage 2: Event grouping ──────────────────────────────────────────
-        # Manual signals don't carry a created_signal record with resolved
-        # locations yet (the manual-signal mutation handles creation API-side).
-        # v2 grouping will still work — admin-2 resolution returns None and
-        # the signal becomes its own event, which matches the pre-existing
-        # behaviour for manual entries.
+        # `created_signal` was fetched above (and refreshed after promotion,
+        # when the geoparser gave us a location the human didn't). Grouping
+        # walks `signal.generalLocation.ancestorIds` to find admin-2, so an
+        # L4 that resolves to a real A2 will now cluster instead of going
+        # isolated.
         from src.services.signal import extract_population_affected_from_text
         actual_pop = extract_population_affected_from_text(title, description)
 
@@ -363,7 +511,7 @@ def process_manual_signal(
             signal_origin_id=None,
             signal_timestamp=None,
             classification=classification,
-            created_signal={},
+            created_signal=created_signal,
             signal_actual_population_affected=actual_pop,
         )
 
@@ -440,6 +588,8 @@ def process_manual_signal(
     bind=True,
     max_retries=2,
     acks_late=True,
+    soft_time_limit=240,
+    time_limit=300,
 )
 def process_gdacs_signal(
     self,
@@ -455,6 +605,30 @@ def process_gdacs_signal(
     2. Group into event (new or existing) via Claude
     3. Assess for alert escalation if high severity
     """
+    # Per-signal dedup — same rationale as process_manual_signal above.
+    lock_key = f"signal:gdacs:{signal_id}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_SIGNAL_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[GDACS] signal_id=%s already being processed — skipping duplicate delivery",
+                signal_id,
+            )
+            return {"signal_id": signal_id, "skipped": True}
+        return _process_gdacs_signal_locked(self, signal_id, gdacs_event, created_signal)
+
+
+def _process_gdacs_signal_locked(
+    self,
+    signal_id: str,
+    gdacs_event: dict,
+    created_signal: dict | None,
+):
+    """Body of `process_gdacs_signal`, executed while holding the per-signal
+    dedup lock."""
     try:
         glide_type = gdacs_event.get("glide_type", "ot")
         severity = gdacs_event.get("severity", 3)
@@ -540,6 +714,8 @@ def process_gdacs_signal(
     bind=True,
     max_retries=2,
     acks_late=True,
+    soft_time_limit=240,
+    time_limit=300,
 )
 def process_acled_signal(
     self,
@@ -555,6 +731,30 @@ def process_acled_signal(
     2. Group into event (new or existing) via Claude
     3. Assess for alert escalation if high severity (fatalities / event type)
     """
+    # Per-signal dedup — same rationale as process_manual_signal above.
+    lock_key = f"signal:acled:{signal_id}"
+    with redis_lock(
+        lock_key,
+        ttl_seconds=_SIGNAL_LOCK_TTL_SECONDS,
+        wait_seconds=0,
+    ) as acquired:
+        if not acquired:
+            logger.info(
+                "[ACLED] signal_id=%s already being processed — skipping duplicate delivery",
+                signal_id,
+            )
+            return {"signal_id": signal_id, "skipped": True}
+        return _process_acled_signal_locked(self, signal_id, acled_event, created_signal)
+
+
+def _process_acled_signal_locked(
+    self,
+    signal_id: str,
+    acled_event: dict,
+    created_signal: dict | None,
+):
+    """Body of `process_acled_signal`, executed while holding the per-signal
+    dedup lock."""
     try:
         glide_type = acled_event.get("glide_type", "ot")
         severity = acled_event.get("severity", 2)

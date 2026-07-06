@@ -49,6 +49,14 @@ mutation UpdateSignalGeoparsedData($id: String!, $geoparsedData: JSON!) {
 }
 """
 
+UPDATE_SIGNAL_LOCATION = """
+mutation UpdateSignalLocation($id: String!, $locationId: String!) {
+  updateSignalLocation(id: $id, locationId: $locationId) {
+    id
+  }
+}
+"""
+
 CREATE_EVENT = """
 mutation CreateEvent($input: CreateEventInput!) {
   createEvent(input: $input) {
@@ -270,6 +278,31 @@ query RecentAlerts {
 
 # ─── Queries ──────────────────────────────────────────────────────────────────
 
+GET_SIGNAL = """
+query Signal($id: String!) {
+  signal(id: $id) {
+    id
+    title
+    severity
+    casualties
+    externalId
+    publishedAt
+    # Resolved location objects with the fields resolve_signal_admin2
+    # needs (id / level / ancestorIds). The manual-signal pipeline uses
+    # this to look up the location the user picked in the UI so
+    # event_grouping_v2 can key on the correct admin-2 district instead
+    # of falling through to isolated-event behaviour.
+    originLocation { id name level ancestorIds }
+    destinationLocation { id name level ancestorIds }
+    generalLocation { id name level ancestorIds }
+    # Same short-circuit rationale as CREATE_SIGNAL: if the signal is
+    # already linked to an event from a prior run, group_signal_v2
+    # returns that event instead of re-clustering.
+    events { id title types severity casualties populationAffected }
+  }
+}
+"""
+
 GET_LATEST_SIGNAL = """
 query LatestSignal {
   signals {
@@ -415,6 +448,16 @@ def create_signal(input_data: dict) -> dict:
     return result["createSignal"]
 
 
+def get_signal(signal_id: str) -> dict | None:
+    """Fetch an existing signal with its resolved origin/general/destination
+    locations. Used by the manual-signal pipeline path where the signal
+    is created API-side (with the location the user picked in the UI)
+    before the Celery task runs — event_grouping_v2 needs the location
+    to key on the admin-2 district."""
+    result = _execute(GET_SIGNAL, {"id": signal_id})
+    return result.get("signal")
+
+
 def update_signal_severity(signal_id: str, severity: int) -> dict:
     """Update a signal's severity score (1-5)."""
     result = _execute(UPDATE_SIGNAL_SEVERITY, {"id": signal_id, "severity": severity})
@@ -430,6 +473,19 @@ def update_signal_geoparsed_data(signal_id: str, geoparsed_data: dict) -> dict:
         {"id": signal_id, "geoparsedData": geoparsed_data},
     )
     return result["updateSignalGeoparsedData"]
+
+
+def update_signal_location(signal_id: str, location_id: str) -> dict:
+    """Set an existing signal's `generalLocation`. Used by the manual-signal
+    pipeline path when the user didn't pick a location and the geoparser
+    resolved a landmark — we promote the landmark to an L4 and wire the
+    signal to it so downstream event grouping can key on the correct
+    admin-2 district."""
+    result = _execute(
+        UPDATE_SIGNAL_LOCATION,
+        {"id": signal_id, "locationId": location_id},
+    )
+    return result["updateSignalLocation"]
 
 
 def create_event(input_data: dict) -> dict:
