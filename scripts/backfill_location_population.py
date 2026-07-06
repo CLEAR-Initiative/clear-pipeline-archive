@@ -8,6 +8,7 @@ its geometry, and writes the result back via updateLocationPopulation.
 Usage:
     python scripts/backfill_location_population.py                # SDN, levels 0,1,2
     python scripts/backfill_location_population.py --iso3 AFG     # Afghanistan
+    python scripts/backfill_location_population.py --iso3 VEN     # Venezuela
     python scripts/backfill_location_population.py --levels 2     # level 2 only
     python scripts/backfill_location_population.py --levels 0,1   # two levels
     python scripts/backfill_location_population.py --force        # recompute even if populated
@@ -112,7 +113,7 @@ def main() -> None:
         help=(
             "Country ISO3 code — selects the WorldPop GeoTIFF via "
             "POPULATION_TIFF_S3_KEYS in src/services/population.py "
-            "(default: SDN). Examples: SDN, AFG."
+            "(default: SDN). Examples: SDN, AFG, VEN."
         ),
     )
     args = parser.parse_args()

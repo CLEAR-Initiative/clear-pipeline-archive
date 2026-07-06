@@ -3,6 +3,7 @@
 Usage:
     python scripts/upload_population_tiff.py                  # SDN (default)
     python scripts/upload_population_tiff.py --iso3 AFG       # Afghanistan
+    python scripts/upload_population_tiff.py --iso3 VEN       # Venezuela
 
 Requires S3 env vars: S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 """
@@ -44,7 +45,7 @@ def main():
     parser.add_argument(
         "--iso3",
         default="SDN",
-        help="Country ISO3 code (default: SDN). Examples: SDN, AFG.",
+        help="Country ISO3 code (default: SDN). Examples: SDN, AFG, VEN.",
     )
     args = parser.parse_args()
 

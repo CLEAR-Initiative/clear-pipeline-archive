@@ -13,7 +13,9 @@ For each OCHA feature at the target admin levels:
          location at the polygon's representative point, child of the new row.
 
 Usage:
-    python scripts/backfill_missing_admin_locations.py                 # levels 0,1,2
+    python scripts/backfill_missing_admin_locations.py                 # SDN, levels 0,1,2
+    python scripts/backfill_missing_admin_locations.py --iso3 AFG      # Afghanistan
+    python scripts/backfill_missing_admin_locations.py --iso3 VEN      # Venezuela
     python scripts/backfill_missing_admin_locations.py --levels 2      # districts only
     python scripts/backfill_missing_admin_locations.py --with-centroid-points
     python scripts/backfill_missing_admin_locations.py --dry-run       # print plan only

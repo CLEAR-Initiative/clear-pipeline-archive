@@ -24,6 +24,7 @@ _CACHE_DIR = Path(tempfile.gettempdir()) / "clear_population_data"
 POPULATION_TIFF_S3_KEYS: dict[str, str] = {
     "SDN": "population/sdn_pop_2026_CN_100m_R2025A_v1.tif",
     "AFG": "population/afg_pop_2026_CN_100m_R2025A_v1.tif",
+    "VEN": "population/ven_pop_2026_CN_100m_R2025A_v1.tif",
 }
 
 # Default radius in km when signal doesn't provide one

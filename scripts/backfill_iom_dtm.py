@@ -45,6 +45,7 @@ METADATA_TYPE = "iom_dtm_displacement"
 ISO3_TO_DTM_FILTERS: dict[str, tuple[str, str]] = {
     "SDN": ("Sudan", "SDN"),
     "AFG": ("Afghanistan", "AFG"),
+    "VEN": ("Venezuela", "VEN"),
 }
 
 logging.basicConfig(
