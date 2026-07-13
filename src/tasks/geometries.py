@@ -34,6 +34,7 @@ OCHA_ADMIN_BOUNDARIES_URLS: dict[str, str] = {
     "LBN": "https://data.humdata.org/dataset/569beba7-bad7-4951-a19d-468a035461cd/resource/81ca0135-b5c9-46e0-a546-f0bdd6d7fd42/download/lbn_admin_boundaries.geojson.zip",
     "AFG": "https://data.humdata.org/dataset/4c303d7b-8eae-4a5a-a3aa-b2331fa39d74/resource/330aad34-2254-4622-afac-e98ace1524ae/download/afg_admin_boundaries.geojson.zip",
     "IRN": "https://data.humdata.org/dataset/247b4026-79ff-4b16-95b9-0f366792d2cc/resource/f8314b60-dc85-4fd1-8936-3dff46a2283a/download/irn_admin_boundaries.geojson.zip",
+    "VEN": "https://data.humdata.org/dataset/5b141d29-534f-4f01-a0bc-41e2f375d925/resource/a7636e17-418e-461b-aa4d-f613f7c8dda5/download/ven_admin_boundaries.geojson.zip",
 }
 
 

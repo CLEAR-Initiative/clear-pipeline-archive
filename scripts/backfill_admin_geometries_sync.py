@@ -10,7 +10,9 @@ Matching order per OCHA feature:
 Unmatched features are printed in an end-of-run summary with coords.
 
 Usage:
-    python scripts/backfill_admin_geometries_sync.py                # levels 0,1,2
+    python scripts/backfill_admin_geometries_sync.py                # SDN, levels 0,1,2
+    python scripts/backfill_admin_geometries_sync.py --iso3 AFG     # Afghanistan
+    python scripts/backfill_admin_geometries_sync.py --iso3 VEN     # Venezuela
     python scripts/backfill_admin_geometries_sync.py --levels 0     # country only
     python scripts/backfill_admin_geometries_sync.py --levels 2     # districts only
     python scripts/backfill_admin_geometries_sync.py --dry-run      # print, no writes
