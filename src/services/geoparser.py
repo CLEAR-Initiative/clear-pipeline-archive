@@ -35,7 +35,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from src.clients import nominatim
+from src.clients import graphql, nominatim
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +476,75 @@ def extract_top_candidate(
     return top.name
 
 
+def _configured_country_codes() -> set[str]:
+    """ISO-3166-1 alpha-2 codes the geocoder may resolve into — the
+    pipeline's supported countries, from `settings.geoparser_country_codes`.
+    Falls back to Sudan only if the setting is somehow empty."""
+    codes = {
+        c.strip().lower()
+        for c in settings.geoparser_country_codes.split(",")
+        if c.strip()
+    }
+    return codes or {"sd"}
+
+
+def _resolve_via_gazetteer(top: Candidate, expected: set[str]) -> GeoparseResult | None:
+    """Hybrid tier 1: look the top candidate up in clear-api's offline
+    GeoNames gazetteer. Returns a GeoparseResult on a confident hit, else
+    None so the caller falls back to LocationIQ.
+
+    Country scope: pin the lookup to the one expected country when
+    unambiguous; otherwise search every loaded country and drop a hit
+    outside the expected set. A wrong-country hit that slips through is
+    still caught by clear-api's same-A2 check when the L4 is promoted."""
+    cc = next(iter(expected)).upper() if len(expected) == 1 else None
+    try:
+        hit = graphql.resolve_gazetteer_location(
+            top.name,
+            country_code=cc,
+            min_similarity=settings.geoparser_gazetteer_min_similarity,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort, fall back to LocationIQ
+        logger.warning(
+            "[geoparser] gazetteer lookup failed for %r (%s) — trying LocationIQ",
+            top.name, exc,
+        )
+        return None
+
+    if not hit:
+        return None
+    country = (hit.get("countryCode") or "").lower()
+    if expected and country and country not in expected:
+        logger.info(
+            "[geoparser] gazetteer hit %r resolved to %s (outside expected) — skipping",
+            hit.get("name"), country,
+        )
+        return None
+    try:
+        lat = float(hit["latitude"])
+        lng = float(hit["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    logger.info(
+        "[geoparser] gazetteer resolved %r -> %r (%s, score=%.2f, exact=%s)",
+        top.name, hit.get("name"), country, float(hit.get("score") or 0), hit.get("exact"),
+    )
+    return GeoparseResult(
+        candidate=top.name,
+        kind=top.kind,
+        field=top.field,
+        lat=lat,
+        lng=lng,
+        country_code=country or None,
+        osm_class=None,
+        osm_type=f"geonames:{hit.get('featureCode') or ''}",
+        importance=float(hit.get("score") or 0.0),
+        display_name=hit.get("name") or top.name,
+        raw=hit,
+    )
+
+
 def geoparse_signal(
     title: str | None,
     description: str | None = None,
@@ -495,7 +565,7 @@ def geoparse_signal(
     location, call `extract_top_candidate(title, description)` separately
     — the extraction stages succeed even when Nominatim doesn't.
     """
-    expected = expected_country_codes or {"sd"}
+    expected = expected_country_codes or _configured_country_codes()
 
     candidates: list[Candidate] = []
     candidates.extend(_extract_from_text(title or "", "title"))
@@ -524,6 +594,15 @@ def geoparse_signal(
         logger.info("[geoparser] top candidate %r is disqualified — bailing", top.name)
         return None
 
+    # ── Hybrid tier 1: offline GeoNames gazetteer (clear-api) ─────────
+    # Transliteration-tolerant and quota-free; resolves the bulk of place
+    # names. LocationIQ below only handles what the gazetteer misses.
+    if settings.geoparser_use_gazetteer:
+        gaz = _resolve_via_gazetteer(top, expected)
+        if gaz is not None:
+            return gaz
+
+    # ── Hybrid tier 2: LocationIQ / Nominatim (landmarks & POIs) ──────
     # Resolve the top candidate via Nominatim, trying transliteration
     # variants. Variants are dedup'd and returned in priority order; the
     # first one with a usable result wins.

@@ -153,6 +153,22 @@ class Settings(BaseSettings):
     # Nominatim / similar by changing only these two settings.
     locationiq_api_key: str = ""  # empty disables the geocoder entirely
     locationiq_base_url: str = "https://us1.locationiq.com/v1"
+    # ISO-3166-1 alpha-2 codes the geocoder may resolve into — the
+    # pipeline's supported countries. Biases the geocode query
+    # (`countrycodes=`) and filters out any candidate resolving outside the
+    # set. Comma-separated. Default covers all three POC countries; a
+    # cross-country mis-resolution is still caught downstream by clear-api's
+    # same-A2 check against the signal's source coordinates.
+    geoparser_country_codes: str = "sd,ve,af"
+    # Hybrid geo-resolver: try the offline GeoNames gazetteer in clear-api
+    # (`resolveGazetteerLocation`) before LocationIQ. Transliteration-tolerant
+    # and quota-free; LocationIQ then only handles the landmarks/POIs the
+    # gazetteer lacks. Kill-switch to fall back to LocationIQ-only.
+    geoparser_use_gazetteer: bool = True
+    # Minimum pg_trgm similarity (0–1) for a fuzzy gazetteer match. Lower =
+    # more recall but more false matches (caught downstream by the same-A2
+    # check against source coords). 1.0 would accept only exact hits.
+    geoparser_gazetteer_min_similarity: float = 0.45
 
     # User-Agent string sent on every geocoder request. Required by both
     # OSMF Nominatim policy and LocationIQ TOS. Identifies the application

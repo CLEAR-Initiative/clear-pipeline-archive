@@ -833,6 +833,45 @@ def find_or_create_landmark_l4(
     return result["findOrCreateLandmarkL4"]
 
 
+RESOLVE_GAZETTEER_LOCATION = """
+query ResolveGazetteerLocation($name: String!, $countryCode: String, $minSimilarity: Float) {
+  resolveGazetteerLocation(name: $name, countryCode: $countryCode, minSimilarity: $minSimilarity) {
+    geonamesId
+    name
+    latitude
+    longitude
+    featureClass
+    featureCode
+    countryCode
+    population
+    score
+    exact
+  }
+}
+"""
+
+
+def resolve_gazetteer_location(
+    name: str,
+    *,
+    country_code: str | None = None,
+    min_similarity: float | None = None,
+) -> dict | None:
+    """Resolve a place name against clear-api's offline GeoNames gazetteer.
+
+    Returns the GazetteerHit dict (latitude/longitude, featureClass, score,
+    exact, …) or None when nothing matches. The hybrid geoparser's first,
+    offline tier; LocationIQ is the fallback for landmarks/POIs it lacks.
+    """
+    variables: dict = {"name": name}
+    if country_code:
+        variables["countryCode"] = country_code
+    if min_similarity is not None:
+        variables["minSimilarity"] = min_similarity
+    data = _execute(RESOLVE_GAZETTEER_LOCATION, variables)
+    return data.get("resolveGazetteerLocation")
+
+
 GET_CRISIS_CANONICAL = """
 query CrisisCanonical($id: String!) {
   crisis(id: $id) {
