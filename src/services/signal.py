@@ -5,7 +5,12 @@ import re
 
 from src.clients.graphql import create_signal, find_or_create_landmark_l4
 from src.models.dataminr import DataminrSignal
-from src.services.geoparser import GeoparseResult, extract_top_candidate, geoparse_signal
+from src.services.geoparser import (
+    GeoparseResult,
+    country_from_coords,
+    extract_top_candidate,
+    geoparse_signal,
+)
 from src.services.location import resolve_signal_location
 
 logger = logging.getLogger(__name__)
@@ -266,8 +271,18 @@ def enrich_with_geoparser(
         geoparser_body = (
             f"{description}\n{extra_body_text}" if description else extra_body_text
         )
+    # Scope the geocode to the country the signal's source coordinates fall
+    # in. Without this, geoparse_signal searches all supported countries at
+    # once and a same-named place in another POC country can outrank the
+    # correct one (Sudanese OSM entries score near-zero importance). Falls
+    # back to all configured countries when coords are missing or land
+    # outside every box.
+    scoped_country = country_from_coords(input_data.get("lat"), input_data.get("lng"))
+    expected = {scoped_country} if scoped_country else None
     try:
-        geo_result = geoparse_signal(title, geoparser_body)
+        geo_result = geoparse_signal(
+            title, geoparser_body, expected_country_codes=expected
+        )
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning("[%s] Geoparser failed (continuing without enrichment): %s", log_tag, exc)
         return None
