@@ -164,7 +164,12 @@ class Settings(BaseSettings):
     # (`resolveGazetteerLocation`) before LocationIQ. Transliteration-tolerant
     # and quota-free; LocationIQ then only handles the landmarks/POIs the
     # gazetteer lacks. Kill-switch to fall back to LocationIQ-only.
-    geoparser_use_gazetteer: bool = True
+    #
+    # Ships DARK (False): the `resolveGazetteerLocation` field must be deployed
+    # in clear-api first — until then an unknown GraphQL field is an *error*,
+    # not a graceful miss, so every signal would log an error before falling
+    # back. Flip to True only after clear-api's gazetteer resolver is live.
+    geoparser_use_gazetteer: bool = False
     # Minimum pg_trgm similarity (0–1) for a fuzzy gazetteer match. Lower =
     # more recall but more false matches (caught downstream by the same-A2
     # check against source coords). 1.0 would accept only exact hits.

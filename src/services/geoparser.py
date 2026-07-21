@@ -346,6 +346,14 @@ def _rank(candidates: list[Candidate]) -> list[Candidate]:
 _REJECTED_CLASSES: frozenset[str] = frozenset({"highway", "railway", "waterway"})
 
 
+# GeoNames analogue of `_REJECTED_CLASSES` for the gazetteer tier. Feature
+# classes that are linear or zonal rather than discrete points: R=road/
+# railroad, H=hydrographic (streams, wadis, lakes), V=vegetation (forest,
+# grassland). Same rationale — promoting one to an A4 point would attribute a
+# signal to an arbitrary spot on a road or a stretch of river.
+_REJECTED_FEATURE_CLASSES: frozenset[str] = frozenset({"R", "H", "V"})
+
+
 def _pick_best_nominatim_result(
     results: list[dict],
     expected_country_codes: set[str],
@@ -488,6 +496,42 @@ def _configured_country_codes() -> set[str]:
     return codes or {"sd"}
 
 
+# Bounding boxes (min_lat, max_lat, min_lng, max_lng) for the POC countries,
+# used only to pick which configured country a signal's source coordinates
+# fall in. The three are on separate continents, so a coarse box is
+# unambiguous — this is never used for precise containment. Add a box here
+# when adding a country to `geoparser_country_codes`.
+_COUNTRY_BBOXES: dict[str, tuple[float, float, float, float]] = {
+    "sd": (8.0, 23.5, 21.0, 39.5),    # Sudan
+    "ve": (0.0, 13.0, -74.0, -59.0),  # Venezuela
+    "af": (29.0, 39.5, 60.0, 75.5),   # Afghanistan
+}
+
+
+def country_from_coords(lat: float | None, lng: float | None) -> str | None:
+    """Return the configured-country ISO2 whose bounding box contains the
+    point, or None when the coordinates are missing or fall outside every
+    configured country.
+
+    Callers use this to scope a signal's geocode to the one country it's
+    actually in. Without it, `geoparse_signal` searches all supported
+    countries at once, and because Sudanese OSM entries carry near-zero
+    importance a same-named place in another POC country outranks the correct
+    one (and the gazetteer's country pin goes unused)."""
+    if lat is None or lng is None:
+        return None
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return None
+    for cc in _configured_country_codes():
+        box = _COUNTRY_BBOXES.get(cc)
+        if box and box[0] <= lat_f <= box[1] and box[2] <= lng_f <= box[3]:
+            return cc
+    return None
+
+
 def _resolve_via_gazetteer(top: Candidate, expected: set[str]) -> GeoparseResult | None:
     """Hybrid tier 1: look the top candidate up in clear-api's offline
     GeoNames gazetteer. Returns a GeoparseResult on a confident hit, else
@@ -513,13 +557,30 @@ def _resolve_via_gazetteer(top: Candidate, expected: set[str]) -> GeoparseResult
 
     if not hit:
         return None
+
+    # Country guard. Reject a hit outside the expected set — and, when an
+    # expected set is given, reject one whose countryCode is missing entirely:
+    # an unverifiable hit must not bypass the guardrail, so fall back to
+    # LocationIQ instead of accepting it.
     country = (hit.get("countryCode") or "").lower()
-    if expected and country and country not in expected:
+    if expected and country not in expected:
         logger.info(
-            "[geoparser] gazetteer hit %r resolved to %s (outside expected) — skipping",
-            hit.get("name"), country,
+            "[geoparser] gazetteer hit %r resolved to %r (missing/outside expected %s) — skipping",
+            hit.get("name"), country or None, sorted(expected),
         )
         return None
+
+    # Feature-class guard, mirroring `_REJECTED_CLASSES` on the LocationIQ
+    # tier: reject linear/zonal GeoNames classes that can't be meaningfully
+    # promoted to a point L4. The field is already selected in the query.
+    feature_class = (hit.get("featureClass") or "").upper()
+    if feature_class in _REJECTED_FEATURE_CLASSES:
+        logger.info(
+            "[geoparser] gazetteer hit %r is feature class %s (linear/zonal) — skipping",
+            hit.get("name"), feature_class,
+        )
+        return None
+
     try:
         lat = float(hit["latitude"])
         lng = float(hit["longitude"])
@@ -597,7 +658,14 @@ def geoparse_signal(
     # ── Hybrid tier 1: offline GeoNames gazetteer (clear-api) ─────────
     # Transliteration-tolerant and quota-free; resolves the bulk of place
     # names. LocationIQ below only handles what the gazetteer misses.
-    if settings.geoparser_use_gazetteer:
+    #
+    # Landmarks skip the gazetteer: GeoNames covers admin units and populated
+    # places densely but carries few POIs, so a fuzzy match on "Nyala Airport"
+    # lands on the populated place "Nyala" — a city centroid the same-A2 check
+    # can't reject (it's in the same district as the airport), which would pin
+    # a permanently wrong landmark L4. Landmarks go straight to LocationIQ
+    # tier 2, which does resolve aerodromes / hospitals / camps.
+    if settings.geoparser_use_gazetteer and top.kind != "landmark":
         gaz = _resolve_via_gazetteer(top, expected)
         if gaz is not None:
             return gaz

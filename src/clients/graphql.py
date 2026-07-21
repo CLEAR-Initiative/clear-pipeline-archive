@@ -864,11 +864,14 @@ def resolve_gazetteer_location(
     offline tier; LocationIQ is the fallback for landmarks/POIs it lacks.
     """
     variables: dict = {"name": name}
-    if country_code:
+    if country_code is not None:
         variables["countryCode"] = country_code
     if min_similarity is not None:
         variables["minSimilarity"] = min_similarity
-    data = _execute(RESOLVE_GAZETTEER_LOCATION, variables)
+    # retries=1 (single attempt, no backoff): this tier is best-effort with a
+    # LocationIQ fallback, so a transient clear-api error must not stall the
+    # Celery worker through ~6s of retry sleeps before the fallback runs.
+    data = _execute(RESOLVE_GAZETTEER_LOCATION, variables, retries=1)
     return data.get("resolveGazetteerLocation")
 
 
