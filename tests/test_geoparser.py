@@ -21,6 +21,17 @@ import pytest
 from src.services import geoparser as gp
 
 
+@pytest.fixture(autouse=True)
+def _gazetteer_miss(monkeypatch):
+    """Exercise the hybrid path with the gazetteer ENABLED but returning a
+    miss, so the existing tests fall through to the LocationIQ tier exactly as
+    before. The production default is off (ship-dark) until clear-api's
+    resolver is deployed; enabling it here keeps the tier's tests meaningful.
+    Gazetteer-specific tests override the client return value (or the flag)."""
+    monkeypatch.setattr(gp.settings, "geoparser_use_gazetteer", True)
+    monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", lambda *a, **k: None)
+
+
 # ─── Extraction ───────────────────────────────────────────────────────────
 
 
@@ -368,9 +379,10 @@ class TestGeoparseSignal:
     def test_passes_country_codes_to_nominatim(self):
         with patch.object(gp.nominatim, "search", return_value=[self._nominatim_hit()]) as mock_search:
             gp.geoparse_signal("Armed clash in Al Fasher")
-        # By default, Sudan-focused.
+        # By default, all POC countries (settings.geoparser_country_codes),
+        # sorted + comma-joined.
         _, kwargs = mock_search.call_args
-        assert kwargs.get("country_codes") == "sd"
+        assert kwargs.get("country_codes") == "af,sd,ve"
 
     def test_accepts_custom_country_codes(self):
         hit = self._nominatim_hit(country="ng")
@@ -450,3 +462,150 @@ class TestExtractTopCandidate:
         title = "Reports in Nyala"
         body = "Strike at Nyala Airport confirmed"
         assert gp.extract_top_candidate(title, body) == "Nyala Airport"
+
+
+def _nominatim_place_hit() -> dict:
+    return {
+        "lat": "13.6", "lon": "25.3", "importance": 0.65,
+        "class": "place", "type": "city",
+        "display_name": "Al Fasher, North Darfur, Sudan",
+        "address": {"country_code": "sd"},
+    }
+
+
+class TestGazetteerTier:
+    """Hybrid resolver: the gazetteer is consulted before LocationIQ."""
+
+    _GAZ_SD = {
+        "geonamesId": 1, "name": "El Fasher", "latitude": 13.6, "longitude": 25.35,
+        "featureClass": "P", "featureCode": "PPLA", "countryCode": "SD",
+        "population": 100000, "score": 1.0, "exact": True,
+    }
+
+    def test_gazetteer_hit_short_circuits_locationiq(self, monkeypatch):
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", lambda *a, **k: self._GAZ_SD)
+        with patch.object(gp.nominatim, "search") as mock_search:
+            result = gp.geoparse_signal("Clashes in El Fasher")
+        assert result is not None
+        assert (result.lat, result.lng) == (13.6, 25.35)
+        assert result.country_code == "sd"
+        assert result.raw["exact"] is True
+        mock_search.assert_not_called()  # gazetteer short-circuited LocationIQ
+
+    def test_gazetteer_miss_falls_back_to_locationiq(self):
+        # The autouse fixture already returns None (miss).
+        with patch.object(gp.nominatim, "search", return_value=[_nominatim_place_hit()]) as mock_search:
+            result = gp.geoparse_signal("Clash in Al Fasher")
+        assert result is not None
+        mock_search.assert_called()
+
+    def test_wrong_country_hit_skipped(self, monkeypatch):
+        ve = {**self._GAZ_SD, "name": "Caracas", "countryCode": "VE",
+              "latitude": 10.5, "longitude": -66.9}
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", lambda *a, **k: ve)
+        with patch.object(gp.nominatim, "search", return_value=[]) as mock_search:
+            result = gp.geoparse_signal("Clash in Caracas", expected_country_codes={"sd"})
+        mock_search.assert_called()  # VE hit outside {sd} skipped -> LocationIQ tried
+        assert result is None
+
+    def test_kill_switch_skips_gazetteer(self, monkeypatch):
+        called = {"n": 0}
+
+        def spy(*a, **k):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", spy)
+        monkeypatch.setattr(gp.settings, "geoparser_use_gazetteer", False)
+        with patch.object(gp.nominatim, "search", return_value=[_nominatim_place_hit()]):
+            gp.geoparse_signal("Clash in Al Fasher")
+        assert called["n"] == 0  # gazetteer not consulted when disabled
+
+    def test_gazetteer_exception_falls_back_to_locationiq(self, monkeypatch):
+        # The branch that runs before clear-api's resolver is deployed: an
+        # unknown GraphQL field raises, and _resolve_via_gazetteer must swallow
+        # it so LocationIQ still runs.
+        def boom(*a, **k):
+            raise RuntimeError("GraphQL errors: Cannot query field 'resolveGazetteerLocation'")
+
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", boom)
+        hits = [_nominatim_place_hit()]
+        with patch.object(gp.nominatim, "search", return_value=hits) as mock_search:
+            result = gp.geoparse_signal("Clash in Al Fasher")
+        assert result is not None    # exception swallowed
+        mock_search.assert_called()  # LocationIQ still ran
+
+    def test_gazetteer_called_with_scoped_country_and_threshold(self, monkeypatch):
+        # A single expected country must scope the gazetteer's countryCode
+        # argument, and the configured similarity floor must be forwarded.
+        seen: dict = {}
+
+        def spy(name, *, country_code=None, min_similarity=None):
+            seen.update(name=name, country_code=country_code, min_similarity=min_similarity)
+            return None
+
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", spy)
+        with patch.object(gp.nominatim, "search", return_value=[]):
+            gp.geoparse_signal("Clash in Al Fasher", expected_country_codes={"sd"})
+        assert seen["country_code"] == "SD"
+        assert seen["min_similarity"] == gp.settings.geoparser_gazetteer_min_similarity
+
+    def test_landmark_candidate_skips_gazetteer(self, monkeypatch):
+        # A landmark must not consult the gazetteer: a P-class populated-place
+        # hit would pin the airport to a city centroid. It goes to LocationIQ.
+        called = {"n": 0}
+
+        def spy(*a, **k):
+            called["n"] += 1
+            return {**self._GAZ_SD, "name": "Nyala", "featureClass": "P"}
+
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", spy)
+        hits = [_nominatim_place_hit()]
+        with patch.object(gp.nominatim, "search", return_value=hits) as mock_search:
+            result = gp.geoparse_signal("Clashes at Nyala Airport")
+        assert called["n"] == 0       # landmark never consults the gazetteer
+        mock_search.assert_called()   # LocationIQ handles the POI
+        assert result is not None
+
+    def test_rejected_feature_class_falls_back_to_locationiq(self, monkeypatch):
+        # A hydrographic (H) hit is linear/zonal — skip it, try LocationIQ.
+        hydro = {**self._GAZ_SD, "name": "Wadi Somewhere", "featureClass": "H"}
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", lambda *a, **k: hydro)
+        hits = [_nominatim_place_hit()]
+        with patch.object(gp.nominatim, "search", return_value=hits) as mock_search:
+            result = gp.geoparse_signal("Flooding in Kadugli")
+        mock_search.assert_called()   # H-class hit skipped -> LocationIQ
+        assert result is not None
+
+    def test_missing_country_hit_skipped_when_expected_set(self, monkeypatch):
+        # A hit with no countryCode can't be verified against the expected
+        # set, so it must not bypass the guardrail.
+        no_cc = {**self._GAZ_SD, "countryCode": None}
+        monkeypatch.setattr(gp.graphql, "resolve_gazetteer_location", lambda *a, **k: no_cc)
+        with patch.object(gp.nominatim, "search", return_value=[]) as mock_search:
+            result = gp.geoparse_signal("Clash in El Fasher", expected_country_codes={"sd"})
+        mock_search.assert_called()   # unverifiable hit skipped -> LocationIQ
+        assert result is None
+
+
+class TestCountryFromCoords:
+    """Bounding-box scoping of a signal to the one POC country it's in."""
+
+    def test_sudan_coords(self):
+        assert gp.country_from_coords(13.6, 25.3) == "sd"   # Al Fasher
+
+    def test_venezuela_coords(self):
+        assert gp.country_from_coords(10.5, -66.9) == "ve"  # Caracas
+
+    def test_afghanistan_coords(self):
+        assert gp.country_from_coords(34.5, 69.2) == "af"   # Kabul
+
+    def test_outside_all_boxes_returns_none(self):
+        assert gp.country_from_coords(48.85, 2.35) is None  # Paris
+
+    def test_missing_coords_returns_none(self):
+        assert gp.country_from_coords(None, None) is None
+        assert gp.country_from_coords(13.6, None) is None
+
+    def test_non_numeric_returns_none(self):
+        assert gp.country_from_coords("x", "y") is None
