@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     clear_api_url: str = "http://localhost:4000/graphql"
     clear_api_key: str = ""
 
+    # LogIE roads & bridges (ArcGIS FeatureServers → locationMetadata).
+    # Monthly sync; iso3 list is comma-separated. The roads view is multi-
+    # country (covers SDN/AFG/VEN/SSD); bridges is world-wide LogIE.
+    logie_roads_url: str = "https://services3.arcgis.com/t6lYS2Pmd8iVx1fy/arcgis/rest/services/Situational_Roads_view/FeatureServer/0"
+    logie_bridges_url: str = "https://gis.logcluster.org/server/rest/services/LogIE/wld_trs_bridges_b_w_viewer/FeatureServer/0"
+    logistics_iso3: str = "SDN,AFG,VEN"
+
     # Anthropic
     anthropic_api_key: str = ""
     # Default model — used unless a per-stage override below is set.
