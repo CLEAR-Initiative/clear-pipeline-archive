@@ -560,7 +560,7 @@ class TestCrossRunThreading:
         from src.services import ground_intel
 
         messages, existing = second_run_state()
-        existing[0]["reviewState"] = "promoted"
+        existing[0]["reviewState"] = "approved_public"
         seen_prompts = []
 
         def spy(_system, _user, **_kwargs):

@@ -239,7 +239,7 @@ def build_threads(
         return []
 
     appendable = [
-        t for t in (existing_threads or []) if t.get("reviewState") != "promoted"
+        t for t in (existing_threads or []) if t.get("reviewState") != "approved_public"
     ]
     messages_by_id = {m["id"]: m for m in messages}
 
