@@ -129,6 +129,31 @@ class TestFeedParsing:
         assert darfur24.fetch_darfur24_articles() == []
 
 
+# ─── dedupe ────────────────────────────────────────────────────────────────
+
+
+class TestDedupe:
+    def test_second_poll_returns_no_articles(self, fake_redis, recorded_feed):
+        """The Redis seen-set must swallow a full feed replay."""
+        first = darfur24.fetch_darfur24_articles()
+        second = darfur24.fetch_darfur24_articles()
+
+        assert len(first) == 3
+        assert second == []
+
+    def test_seen_keys_are_slug_scoped(self, fake_redis, recorded_feed):
+        darfur24.fetch_darfur24_articles()
+        assert f"darfur24:seen:{EN_SLUG}" in fake_redis.store
+
+    def test_last_synced_set_only_when_new_articles(self, fake_redis, recorded_feed):
+        darfur24.fetch_darfur24_articles()
+        assert darfur24.get_last_synced() is not None
+
+        stamp = fake_redis.store["darfur24:last_synced"]
+        darfur24.fetch_darfur24_articles()  # all deduped → no update
+        assert fake_redis.store["darfur24:last_synced"] == stamp
+
+
 # ─── signal input (poll task) ──────────────────────────────────────────────
 
 
@@ -178,3 +203,82 @@ class TestBuildSignalInput:
 
         input_data = _build_signal_input(self._article(published_at=None), "src_123")
         assert input_data["publishedAt"]  # non-empty ISO timestamp
+
+
+# ─── poll task end-to-end (mocked GraphQL) ─────────────────────────────────
+
+
+class TestPollTask:
+    def test_repolling_creates_no_duplicate_signals(self, fake_redis, recorded_feed):
+        """Acceptance criterion: run the poll twice against the same feed —
+        the second round must create zero signals."""
+        from src.tasks import poll_darfur24 as task_module
+
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module, "create_signal", return_value={"id": "sig_1"}
+            ) as mock_create,
+        ):
+            first = task_module.poll_darfur24.apply().get()
+            second = task_module.poll_darfur24.apply().get()
+
+        assert first == {"articles_found": 3, "signals_created": 3, "failed": 0}
+        assert second == {"articles_found": 0, "signals_created": 0}
+        assert mock_create.call_count == 3
+
+        external_ids = {
+            call.args[0]["externalId"] for call in mock_create.call_args_list
+        }
+        assert f"darfur24:{EN_SLUG}" in external_ids
+        assert len(external_ids) == 3  # all distinct
+
+    def test_missing_data_source_row_raises(self, fake_redis, recorded_feed):
+        """The darfur24 dataSources row must exist in the CLEAR API — fail
+        loudly (and non-retryably surface the config error) when absent."""
+        from src.tasks import poll_darfur24 as task_module
+
+        # reset the module-level cache
+        task_module._darfur24_source_id = None
+
+        with patch.object(task_module, "get_data_sources", return_value=[]):
+            with pytest.raises(Exception) as excinfo:
+                task_module.poll_darfur24.apply(throw=True).get()
+
+        assert "darfur24" in str(excinfo.value)
+
+    def test_one_bad_article_does_not_sink_the_batch(self, fake_redis, recorded_feed):
+        from src.tasks import poll_darfur24 as task_module
+
+        calls = {"n": 0}
+
+        def flaky_create(input_data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return {"id": f"sig_{calls['n']}"}
+
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(task_module, "create_signal", side_effect=flaky_create),
+        ):
+            result = task_module.poll_darfur24.apply().get()
+
+        assert result == {"articles_found": 3, "signals_created": 2, "failed": 1}
+
+
+@pytest.fixture(autouse=True)
+def _reset_source_id_cache():
+    """The poll task caches the source id at module level; isolate tests."""
+    yield
+    import src.tasks.poll_darfur24 as task_module
+
+    task_module._darfur24_source_id = None
