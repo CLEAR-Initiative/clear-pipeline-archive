@@ -9,6 +9,13 @@ GROUND_CLASSIFICATIONS = frozenset(
 )
 
 
+# Incident-thread lifecycle. Observed in the field groups the PRD profiled:
+# reported → updated → confirmed / corrected / retracted.
+GROUND_LIFECYCLE_STATES = frozenset(
+    {"reported", "updated", "confirmed", "corrected", "retracted"}
+)
+
+
 class GroundMessageLabel(BaseModel):
     """One message's classification, as returned by Claude."""
 
@@ -20,3 +27,18 @@ class GroundClassificationResponse(BaseModel):
     """Output from the ground_classify Claude stage."""
 
     classifications: list[GroundMessageLabel]
+
+
+class GroundThreadProposal(BaseModel):
+    """One proposed incident thread, as returned by Claude. Validated and
+    lifecycle-checked deterministically before anything is written back."""
+
+    title: str = ""
+    lifecycle_state: str = ""
+    message_ids: list[str]
+
+
+class GroundThreadingResponse(BaseModel):
+    """Output from the ground_thread Claude stage."""
+
+    threads: list[GroundThreadProposal]

@@ -1053,6 +1053,25 @@ def upsert_ground_message_classifications(inputs: list[dict]) -> list[dict]:
     return result.get("upsertGroundMessageClassifications") or []
 
 
+UPSERT_GROUND_THREADS = """
+mutation UpsertGroundThreads($inputs: [UpsertGroundThreadInput!]!) {
+  upsertGroundThreads(inputs: $inputs) {
+    id
+  }
+}
+"""
+
+
+def upsert_ground_threads(inputs: list[dict]) -> list[dict]:
+    """Create/update incident threads and attach their messages. Each input
+    row must shape as {groundSourceId, title, lifecycleState, messageIds}.
+    Returns the resulting thread ids."""
+    if not inputs:
+        return []
+    result = _execute(UPSERT_GROUND_THREADS, {"inputs": inputs})
+    return result.get("upsertGroundThreads") or []
+
+
 def upsert_translations(
     entity_type: str,
     entity_id: str,

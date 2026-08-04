@@ -12,6 +12,11 @@ possible, LLM only where semantics are genuinely needed.
   verbatim, so no model judgement is involved.
 - Classification (field_report / news_digest / operational / chatter) is
   semantic → one batched Claude call per chunk of messages.
+- Threading (which messages describe the same incident) is semantic → one
+  Claude call over the un-threaded field reports, but every proposal is
+  validated deterministically (known ids only, each message in exactly one
+  thread) and the lifecycle state is derived by rules that the model can
+  inform but not overrule.
 """
 
 from __future__ import annotations
@@ -20,11 +25,19 @@ import logging
 import re
 
 from src.clients.claude import call_claude
-from src.models.ground import GROUND_CLASSIFICATIONS, GroundClassificationResponse
+from src.models.ground import (
+    GROUND_CLASSIFICATIONS,
+    GROUND_LIFECYCLE_STATES,
+    GroundClassificationResponse,
+    GroundThreadingResponse,
+)
 from src.prompts.ground import (
     GROUND_CLASSIFY_PROMPT_VERSION,
     GROUND_CLASSIFY_SYSTEM,
+    GROUND_THREAD_PROMPT_VERSION,
+    GROUND_THREAD_SYSTEM,
     build_ground_classify_prompt,
+    build_ground_thread_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +45,11 @@ logger = logging.getLogger(__name__)
 # Messages per Claude classification call. Output is ~1 short JSON row per
 # message, so 50 messages stay comfortably inside max_tokens=4096.
 CLASSIFY_CHUNK_SIZE = 50
+
+# Cap on field reports considered for threading in one run. Threading needs
+# every candidate in a single prompt (clusters cross chunk boundaries); the
+# oldest N are threaded first and the rest wait for the next run.
+THREAD_BATCH_LIMIT = 150
 
 # ─── Uncertainty markers (deterministic) ───────────────────────────────────
 # Ordered: the first pattern that matches wins. The canonical marker string
@@ -114,3 +132,105 @@ def classify_messages(messages: list[dict]) -> list[dict]:
                 }
             )
     return results
+
+
+# ─── Incident threading (LLM proposes, rules validate) ─────────────────────
+
+
+def derive_lifecycle_state(llm_state: str | None, messages: list[dict]) -> str:
+    """Deterministic lifecycle derivation for a proposed thread.
+
+    The model's judgement is used where the semantics genuinely need it
+    (confirmed vs corrected vs updated), but rules set the floor:
+      - a single-message thread can only ever be "reported"
+      - an out-of-vocabulary state falls back to reported/updated by size
+    """
+    if len(messages) <= 1:
+        return "reported"
+    if llm_state in GROUND_LIFECYCLE_STATES:
+        return llm_state
+    return "updated"
+
+
+def _fallback_title(messages: list[dict]) -> str:
+    first_text = (messages[0].get("text") or "").strip() if messages else ""
+    return first_text[:80] or "Untitled incident"
+
+
+def build_threads(ground_source_id: str, messages: list[dict]) -> list[dict]:
+    """Cluster un-threaded field reports into incident threads via Claude.
+
+    `messages` is the full fetched set; candidates are the field_report
+    messages not yet attached to a thread. Returns upsertGroundThreads
+    inputs: [{groundSourceId, title, lifecycleState, messageIds}].
+
+    Model proposals are validated deterministically:
+      - unknown message ids are dropped
+      - a message claimed by several threads stays with the first
+      - candidate messages the model did not place are left un-threaded
+        (they get another chance next run)
+      - lifecycle state goes through derive_lifecycle_state()
+
+    Raises whatever call_claude raises — the Celery task owns retries.
+    """
+    candidates = [
+        m
+        for m in messages
+        if m.get("classification") == "field_report" and not m.get("threadId")
+    ]
+    candidates.sort(key=lambda m: m.get("sentAt") or "")
+    candidates = candidates[:THREAD_BATCH_LIMIT]
+    if not candidates:
+        return []
+
+    parsed = call_claude(
+        GROUND_THREAD_SYSTEM,
+        build_ground_thread_prompt(candidates),
+        stage="ground_thread",
+        prompt_version=GROUND_THREAD_PROMPT_VERSION,
+        max_tokens=4096,
+    )
+    response = GroundThreadingResponse.model_validate(parsed)
+
+    by_id = {m["id"]: m for m in candidates}
+    claimed: set[str] = set()
+    threads: list[dict] = []
+
+    for proposal in response.threads:
+        member_ids = []
+        for message_id in proposal.message_ids:
+            if message_id not in by_id:
+                logger.warning(
+                    "[GROUND] Threading proposal referenced unknown message %r — dropped.",
+                    message_id,
+                )
+                continue
+            if message_id in claimed:
+                logger.warning(
+                    "[GROUND] Message %s claimed by more than one thread — "
+                    "keeping first assignment.",
+                    message_id,
+                )
+                continue
+            member_ids.append(message_id)
+
+        if not member_ids:
+            continue
+        claimed.update(member_ids)
+
+        members = [by_id[i] for i in member_ids]
+        threads.append(
+            {
+                "groundSourceId": ground_source_id,
+                "title": proposal.title.strip() or _fallback_title(members),
+                "lifecycleState": derive_lifecycle_state(proposal.lifecycle_state, members),
+                "messageIds": member_ids,
+            }
+        )
+
+    unplaced = len(candidates) - len(claimed)
+    if unplaced:
+        logger.info(
+            "[GROUND] %d field report(s) not placed in any thread this run.", unplaced
+        )
+    return threads

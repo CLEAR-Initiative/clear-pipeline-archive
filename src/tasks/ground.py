@@ -12,7 +12,9 @@ PIPELINE CONTRACT (consumed by clear-api's celery service):
   The task processes ALL unclassified groundMessages for that source:
   each is classified as field_report | news_digest | operational |
   chatter, and contributor uncertainty markers ("unconfirmed", "rumour",
-  …) are detected and preserved.
+  …) are detected and preserved. Field reports are then clustered into
+  incident threads with lifecycle states (reported | updated | confirmed
+  | corrected | retracted) via upsertGroundThreads.
 """
 
 import logging
@@ -23,6 +25,7 @@ from src.clients.graphql import (
     GraphQLClientError,
     ground_messages_for_classification,
     upsert_ground_message_classifications,
+    upsert_ground_threads,
 )
 from src.services import ground_intel
 
@@ -52,6 +55,7 @@ def classify_ground_messages(self, ground_source_id: str, limit: int = DEFAULT_M
         unclassified = [m for m in messages if not m.get("classification")]
 
         classified_count = 0
+        labels: list[dict] = []
         if unclassified:
             labels = ground_intel.classify_messages(unclassified)
             if labels:
@@ -62,10 +66,27 @@ def classify_ground_messages(self, ground_source_id: str, limit: int = DEFAULT_M
                 ground_source_id, classified_count, len(unclassified),
             )
 
+        # Overlay the labels we just wrote so threading sees the up-to-date
+        # classification without a second fetch.
+        label_by_id = {row["messageId"]: row["classification"] for row in labels}
+        merged = [
+            {**m, "classification": m.get("classification") or label_by_id.get(m["id"])}
+            for m in messages
+        ]
+
+        thread_inputs = ground_intel.build_threads(ground_source_id, merged)
+        thread_rows = upsert_ground_threads(thread_inputs) if thread_inputs else []
+        if thread_inputs:
+            logger.info(
+                "[GROUND] Source %s: upserted %d incident thread(s)",
+                ground_source_id, len(thread_inputs),
+            )
+
         return {
             "ground_source_id": ground_source_id,
             "messages_fetched": len(messages),
             "messages_classified": classified_count,
+            "threads_upserted": len(thread_rows),
         }
 
     except GraphQLClientError as exc:
