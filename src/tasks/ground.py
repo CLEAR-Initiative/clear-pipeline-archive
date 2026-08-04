@@ -36,8 +36,8 @@ from src.services import ground_intel
 
 logger = logging.getLogger(__name__)
 
-# Upper bound on messages fetched per run. A full seed import (the HSS DAO
-# export is ~620 messages) drains over a handful of runs; live capture
+# Upper bound on messages fetched per run. A typical seed export runs
+# ~500-700 messages and drains over a handful of runs; live capture
 # volumes sit far below this.
 DEFAULT_MESSAGE_LIMIT = 500
 
