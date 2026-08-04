@@ -507,6 +507,15 @@ class TestClassifyGroundMessagesTask:
         mock_upsert.assert_not_called()
         mock_threads.assert_not_called()
 
+    def test_task_is_registered_under_the_contract_name(self):
+        """clear-api enqueues by the bare name "classify_ground_messages"
+        (see docs/GROUND_INTEL.md). If the task ever loses that exact
+        registration, enqueued messages are silently discarded by the
+        worker — this is the tripwire."""
+        from src.celery_app import app as celery_app
+
+        assert "classify_ground_messages" in celery_app.tasks
+
     def test_graphql_client_error_is_not_retried(self):
         from src.clients.graphql import GraphQLClientError
         from src.tasks import ground as task_module
