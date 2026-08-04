@@ -13,10 +13,11 @@ possible, LLM only where semantics are genuinely needed.
 - Classification (field_report / news_digest / operational / chatter) is
   semantic → one batched Claude call per chunk of messages.
 - Threading (which messages describe the same incident) is semantic → one
-  Claude call over the un-threaded field reports, but every proposal is
-  validated deterministically (known ids only, each message in exactly one
-  thread) and the lifecycle state is derived by rules that the model can
-  inform but not overrule.
+  Claude call over the un-threaded field reports, with the source's
+  existing threads offered as append targets (cross-run continuity). Every
+  proposal is validated deterministically (known ids only, each message in
+  exactly one thread, appends only to offered threads) and the lifecycle
+  state is derived by rules that the model can inform but not overrule.
 """
 
 from __future__ import annotations
@@ -158,19 +159,31 @@ def classify_messages(messages: list[dict]) -> list[dict]:
 # ─── Incident threading (LLM proposes, rules validate) ─────────────────────
 
 
-def derive_lifecycle_state(llm_state: str | None, messages: list[dict]) -> str:
+def derive_lifecycle_state(
+    llm_state: str | None,
+    messages: list[dict],
+    total_count: int | None = None,
+) -> str:
     """Deterministic lifecycle derivation for a proposed thread.
 
     The model's judgement is used where the semantics genuinely need it
     (confirmed vs corrected vs updated), but rules set the floor:
       - a thread containing an explicit retraction is "retracted",
-        whatever the model proposed
-      - a single-message thread can only ever be "reported"
+        whatever the model proposed — including a lone retraction, which
+        must never read as a fresh "reported" incident
+      - otherwise a single-message thread can only ever be "reported"
       - an out-of-vocabulary state falls back to reported/updated by size
+
+    `total_count` overrides len(messages) for the size rules when the
+    thread has more members than we hold texts for — an append to an
+    existing thread counts that thread's earlier messages even though only
+    the new ones (plus any earlier ones still in the fetch window) are in
+    `messages`.
     """
     if any(is_retraction(m.get("text")) for m in messages):
         return "retracted"
-    if len(messages) <= 1:
+    size = len(messages) if total_count is None else total_count
+    if size <= 1:
         return "reported"
     if llm_state in GROUND_LIFECYCLE_STATES:
         return llm_state
@@ -182,19 +195,36 @@ def _fallback_title(messages: list[dict]) -> str:
     return first_text[:80] or "Untitled incident"
 
 
-def build_threads(ground_source_id: str, messages: list[dict]) -> list[dict]:
+def build_threads(
+    ground_source_id: str,
+    messages: list[dict],
+    existing_threads: list[dict] | None = None,
+) -> list[dict]:
     """Cluster un-threaded field reports into incident threads via Claude.
 
     `messages` is the full fetched set; candidates are the field_report
-    messages not yet attached to a thread. Returns upsertGroundThreads
-    inputs: [{groundSourceId, title, lifecycleState, messageIds}].
+    messages not yet attached to a thread. `existing_threads` (from
+    groundThreadsForSource: {id, title, lifecycleState, reviewState,
+    messageIds}) are offered to the model as APPEND targets — a correction
+    or retraction processed in a later run than its incident, or the tail
+    of an incident that straddled a fetch window, joins the original
+    thread instead of minting an orphan. Threads already promoted for
+    review are never append targets.
+
+    Returns upsertGroundThreads inputs: [{groundSourceId, title,
+    lifecycleState, messageIds}], with `threadId` additionally set on
+    append rows.
 
     Model proposals are validated deterministically:
       - unknown message ids are dropped
       - a message claimed by several threads stays with the first
       - candidate messages the model did not place are left un-threaded
         (they get another chance next run)
-      - lifecycle state goes through derive_lifecycle_state()
+      - a thread_id not among the offered existing threads is ignored
+        (the proposal becomes a new thread)
+      - lifecycle state goes through derive_lifecycle_state(); for appends
+        the existing thread's earlier messages count towards size, and any
+        of them still in the fetch window join the retraction check
 
     Raises whatever call_claude raises — the Celery task owns retries.
     """
@@ -208,9 +238,14 @@ def build_threads(ground_source_id: str, messages: list[dict]) -> list[dict]:
     if not candidates:
         return []
 
+    appendable = [
+        t for t in (existing_threads or []) if t.get("reviewState") != "promoted"
+    ]
+    messages_by_id = {m["id"]: m for m in messages}
+
     parsed = call_claude(
         GROUND_THREAD_SYSTEM,
-        build_ground_thread_prompt(candidates),
+        build_ground_thread_prompt(candidates, appendable, messages_by_id),
         stage="ground_thread",
         prompt_version=GROUND_THREAD_PROMPT_VERSION,
         max_tokens=4096,
@@ -218,6 +253,7 @@ def build_threads(ground_source_id: str, messages: list[dict]) -> list[dict]:
     response = GroundThreadingResponse.model_validate(parsed)
 
     by_id = {m["id"]: m for m in candidates}
+    existing_by_id = {t["id"]: t for t in appendable}
     claimed: set[str] = set()
     threads: list[dict] = []
 
@@ -244,6 +280,41 @@ def build_threads(ground_source_id: str, messages: list[dict]) -> list[dict]:
         claimed.update(member_ids)
 
         members = [by_id[i] for i in member_ids]
+
+        target = None
+        if proposal.thread_id:
+            target = existing_by_id.get(proposal.thread_id)
+            if target is None:
+                logger.warning(
+                    "[GROUND] Proposal referenced unknown or promoted thread %r — "
+                    "creating a new thread instead.",
+                    proposal.thread_id,
+                )
+
+        if target is not None:
+            existing_ids = target.get("messageIds") or []
+            # Earlier members still inside the fetch window contribute their
+            # texts to the retraction check; the rest still count for size.
+            visible_existing = [
+                messages_by_id[i] for i in existing_ids if i in messages_by_id
+            ]
+            threads.append(
+                {
+                    "groundSourceId": ground_source_id,
+                    "threadId": target["id"],
+                    "title": proposal.title.strip()
+                    or (target.get("title") or "").strip()
+                    or _fallback_title(members),
+                    "lifecycleState": derive_lifecycle_state(
+                        proposal.lifecycle_state,
+                        visible_existing + members,
+                        total_count=len(existing_ids) + len(member_ids),
+                    ),
+                    "messageIds": member_ids,
+                }
+            )
+            continue
+
         threads.append(
             {
                 "groundSourceId": ground_source_id,

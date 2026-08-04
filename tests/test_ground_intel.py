@@ -398,11 +398,197 @@ class TestBuildThreads:
         assert threads[0]["title"].startswith("Reports of a drone strike")
 
 
+# ─── cross-run threading (append to existing threads) ──────────────────────
+
+
+def second_run_state():
+    """The fixture as run 2 sees it: the Galaxy compound report (gm_09) was
+    threaded in run 1; its retraction (gm_10) arrived later and is still
+    un-threaded."""
+    messages = classified_messages()
+    for m in messages:
+        if m["id"] == "gm_09":
+            m["threadId"] = "gth_r1"
+    existing = [
+        {
+            "id": "gth_r1",
+            "title": "Reported strikes on the Galaxy compound",
+            "lifecycleState": "reported",
+            "reviewState": "pending",
+            "messageIds": ["gm_09"],
+        }
+    ]
+    return messages, existing
+
+
+class TestCrossRunThreading:
+    def test_existing_threads_are_offered_in_the_prompt(self):
+        from src.services import ground_intel
+
+        messages, existing = second_run_state()
+        seen_prompts = []
+
+        def spy(_system, _user, **_kwargs):
+            seen_prompts.append(_user)
+            return {"threads": []}
+
+        with patch.object(ground_intel, "call_claude", side_effect=spy):
+            ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        prompt = seen_prompts[0]
+        assert "Existing incident threads" in prompt
+        assert "[gth_r1]" in prompt
+        # The member's text is shown (it is still in the fetch window)...
+        assert "Strikes reported this evening on the Galaxy compound" in prompt
+        # ...but the already-threaded message is NOT a candidate.
+        assert "[gm_09]" not in prompt
+
+    def test_retraction_in_a_later_run_retracts_the_original_thread(self):
+        """The reviewer's cross-run gap: a retraction processed a run after
+        its incident must APPEND to the original thread (flipping it to
+        retracted), not become an orphan single-message thread."""
+        from src.services import ground_intel
+
+        messages, existing = second_run_state()
+        proposal = {
+            "threads": [
+                {
+                    "title": "Reported strikes on the Galaxy compound",
+                    "lifecycle_state": "corrected",  # model was too mild
+                    "message_ids": ["gm_10"],
+                    "thread_id": "gth_r1",
+                }
+            ]
+        }
+        with patch.object(ground_intel, "call_claude", return_value=proposal):
+            threads = ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        assert len(threads) == 1  # no orphan thread
+        t = threads[0]
+        assert set(t) == {
+            "groundSourceId", "threadId", "title", "lifecycleState", "messageIds",
+        }
+        assert t["threadId"] == "gth_r1"
+        assert t["messageIds"] == ["gm_10"]  # only the NEW message is attached
+        assert t["lifecycleState"] == "retracted"  # deterministic override
+
+    def test_append_title_falls_back_to_the_existing_threads_title(self):
+        from src.services import ground_intel
+
+        messages, existing = second_run_state()
+        proposal = {
+            "threads": [
+                {
+                    "title": "  ",
+                    "lifecycle_state": "updated",
+                    "message_ids": ["gm_10"],
+                    "thread_id": "gth_r1",
+                }
+            ]
+        }
+        with patch.object(ground_intel, "call_claude", return_value=proposal):
+            threads = ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        assert threads[0]["title"] == "Reported strikes on the Galaxy compound"
+
+    def test_batch_boundary_append_counts_unseen_members_for_lifecycle(self):
+        """An incident straddling two fetch windows: the earlier members are
+        no longer in view, but they still count for thread size — a benign
+        follow-up append must not degrade to 'reported'."""
+        from src.services import ground_intel
+
+        messages = [
+            {
+                "id": "gm_20",
+                "text": "Two more strikes heard near the water point this afternoon.",
+                "sentAt": "2026-04-12T14:00:00+00:00",
+                "senderRef": "member_07",
+                "hasMedia": False,
+                "classification": "field_report",
+                "threadId": None,
+            }
+        ]
+        existing = [
+            {
+                "id": "gth_b",
+                "title": "Drone strikes near Zalingei",
+                "lifecycleState": "corrected",
+                "reviewState": "pending",
+                "messageIds": ["gm_x1", "gm_x2"],  # outside the window
+            }
+        ]
+        proposal = {
+            "threads": [
+                {
+                    "title": "Drone strikes near Zalingei",
+                    "lifecycle_state": "updated",
+                    "message_ids": ["gm_20"],
+                    "thread_id": "gth_b",
+                }
+            ]
+        }
+        with patch.object(ground_intel, "call_claude", return_value=proposal):
+            threads = ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        assert threads[0]["threadId"] == "gth_b"
+        assert threads[0]["lifecycleState"] == "updated"  # 3 members total
+
+    def test_unknown_thread_id_falls_back_to_a_new_thread(self):
+        from src.services import ground_intel
+
+        messages, existing = second_run_state()
+        proposal = {
+            "threads": [
+                {
+                    "title": "Reported checkpoint on the west road",
+                    "lifecycle_state": "reported",
+                    "message_ids": ["gm_08"],
+                    "thread_id": "gth_nope",
+                }
+            ]
+        }
+        with patch.object(ground_intel, "call_claude", return_value=proposal):
+            threads = ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        assert len(threads) == 1
+        assert "threadId" not in threads[0]
+        assert threads[0]["lifecycleState"] == "reported"
+
+    def test_promoted_threads_are_not_append_targets(self):
+        """The server refuses appends to promoted threads — they are neither
+        offered in the prompt nor honoured if the model names one anyway."""
+        from src.services import ground_intel
+
+        messages, existing = second_run_state()
+        existing[0]["reviewState"] = "promoted"
+        seen_prompts = []
+
+        def spy(_system, _user, **_kwargs):
+            seen_prompts.append(_user)
+            return {
+                "threads": [
+                    {
+                        "title": "Galaxy compound report withdrawn",
+                        "lifecycle_state": "retracted",
+                        "message_ids": ["gm_10"],
+                        "thread_id": "gth_r1",
+                    }
+                ]
+            }
+
+        with patch.object(ground_intel, "call_claude", side_effect=spy):
+            threads = ground_intel.build_threads(SOURCE_ID, messages, existing)
+
+        assert "[gth_r1]" not in seen_prompts[0]
+        assert len(threads) == 1
+        assert "threadId" not in threads[0]  # falls back to a new thread
+
+
 # ─── the Celery task (mocked GraphQL transport) ────────────────────────────
 
 
 class TestClassifyGroundMessagesTask:
-    def _run(self, messages, claude=canned_claude):
+    def _run(self, messages, claude=canned_claude, existing_threads=None):
         from src.services import ground_intel
         from src.tasks import ground as task_module
 
@@ -412,6 +598,11 @@ class TestClassifyGroundMessagesTask:
                 "ground_messages_for_classification",
                 return_value=messages,
             ) as mock_query,
+            patch.object(
+                task_module,
+                "ground_threads_for_source",
+                return_value=existing_threads or [],
+            ),
             patch.object(
                 task_module,
                 "upsert_ground_message_classifications",
@@ -462,6 +653,135 @@ class TestClassifyGroundMessagesTask:
         assert zalingei[0]["messageIds"] == ["gm_01", "gm_02", "gm_03", "gm_04"]
         assert all(t["groundSourceId"] == SOURCE_ID for t in inputs)
 
+    def test_two_run_retraction_appends_to_run1_thread_without_orphan(self):
+        """Two-run scenario: the incident threaded in run 1; its retraction
+        arrives in run 2. The retraction must append to the run-1 thread
+        (flipping it retracted) — never create an orphan thread."""
+        messages = [
+            {
+                "id": "gm_a1",
+                "text": "Strikes reported this evening on the Galaxy compound south of town.",
+                "sentAt": "2026-04-12T19:40:00+00:00",
+                "senderRef": "member_06",
+                "hasMedia": False,
+                "classification": "field_report",
+                "threadId": "gth_run1",  # threaded by run 1
+            },
+            {
+                "id": "gm_a2",
+                "text": "About yesterday's report: this turned out to be misreporting. No strikes took place.",
+                "sentAt": "2026-04-13T08:15:00+00:00",
+                "senderRef": "member_06",
+                "hasMedia": False,
+                "classification": None,  # arrived after run 1
+                "threadId": None,
+            },
+        ]
+        existing = [
+            {
+                "id": "gth_run1",
+                "title": "Reported strikes on the Galaxy compound",
+                "lifecycleState": "reported",
+                "reviewState": "pending",
+                "messageIds": ["gm_a1"],
+            }
+        ]
+
+        def claude(_system, _user, *, stage=None, **_kwargs):
+            if stage == "ground_classify":
+                return {
+                    "classifications": [
+                        {"id": "gm_a2", "classification": "field_report"}
+                    ]
+                }
+            return {
+                "threads": [
+                    {
+                        "title": "Reported strikes on the Galaxy compound",
+                        "lifecycle_state": "corrected",  # model too mild
+                        "message_ids": ["gm_a2"],
+                        "thread_id": "gth_run1",
+                    }
+                ]
+            }
+
+        result, _query, _upsert, mock_threads = self._run(
+            messages, claude=claude, existing_threads=existing
+        )
+
+        assert result["threads_upserted"] == 1
+        inputs = mock_threads.call_args.args[0]
+        assert len(inputs) == 1  # append only — no orphan thread
+        assert inputs[0]["threadId"] == "gth_run1"
+        assert inputs[0]["messageIds"] == ["gm_a2"]
+        assert inputs[0]["lifecycleState"] == "retracted"
+
+    def test_batch_boundary_tail_appends_to_run1_thread(self):
+        """Batch-boundary scenario: an incident straddles two fetch windows.
+        Run 2 sees only the tail messages; they append to the run-1 thread
+        instead of forming a duplicate incident."""
+        messages = [
+            {
+                "id": "gm_b3",
+                "text": "Two more strikes heard from the same direction near Zalingei in the last hour.",
+                "sentAt": "2026-04-12T09:02:00+00:00",
+                "senderRef": "member_07",
+                "hasMedia": False,
+                "classification": None,
+                "threadId": None,
+            },
+            {
+                "id": "gm_b4",
+                "text": "Smoke visible over the north road now",
+                "sentAt": "2026-04-12T09:05:00+00:00",
+                "senderRef": "member_07",
+                "hasMedia": True,
+                "classification": None,
+                "threadId": None,
+            },
+        ]
+        existing = [
+            {
+                "id": "gth_zal",
+                "title": "Drone strikes near Zalingei",
+                "lifecycleState": "corrected",
+                "reviewState": "pending",
+                # run-1 members — no longer inside the fetch window
+                "messageIds": ["gm_b1", "gm_b2"],
+            }
+        ]
+
+        def claude(_system, _user, *, stage=None, **_kwargs):
+            if stage == "ground_classify":
+                return {
+                    "classifications": [
+                        {"id": "gm_b3", "classification": "field_report"},
+                        {"id": "gm_b4", "classification": "field_report"},
+                    ]
+                }
+            return {
+                "threads": [
+                    {
+                        "title": "Drone strikes near Zalingei",
+                        "lifecycle_state": "updated",
+                        "message_ids": ["gm_b3", "gm_b4"],
+                        "thread_id": "gth_zal",
+                    }
+                ]
+            }
+
+        result, _query, _upsert, mock_threads = self._run(
+            messages, claude=claude, existing_threads=existing
+        )
+
+        assert result["threads_upserted"] == 1
+        inputs = mock_threads.call_args.args[0]
+        assert len(inputs) == 1
+        assert inputs[0]["threadId"] == "gth_zal"
+        assert inputs[0]["messageIds"] == ["gm_b3", "gm_b4"]
+        # 2 unseen run-1 members + 2 new → multi-message; model state stands.
+        assert inputs[0]["lifecycleState"] == "updated"
+
     def test_already_classified_messages_are_not_reclassified(self):
         messages = load_messages()
         for m in messages[:8]:
@@ -492,6 +812,9 @@ class TestClassifyGroundMessagesTask:
                 task_module, "ground_messages_for_classification", return_value=[]
             ),
             patch.object(
+                task_module, "ground_threads_for_source"
+            ) as mock_existing,
+            patch.object(
                 task_module, "upsert_ground_message_classifications"
             ) as mock_upsert,
             patch.object(task_module, "upsert_ground_threads") as mock_threads,
@@ -501,6 +824,7 @@ class TestClassifyGroundMessagesTask:
 
         assert result["messages_fetched"] == 0
         mock_call.assert_not_called()
+        mock_existing.assert_not_called()  # nothing to thread → no thread fetch
         mock_upsert.assert_not_called()
         mock_threads.assert_not_called()
 

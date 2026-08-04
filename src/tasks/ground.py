@@ -14,7 +14,11 @@ PIPELINE CONTRACT (consumed by clear-api's celery service):
   chatter, and contributor uncertainty markers ("unconfirmed", "rumour",
   …) are detected and preserved. Field reports are then clustered into
   incident threads with lifecycle states (reported | updated | confirmed
-  | corrected | retracted) via upsertGroundThreads.
+  | corrected | retracted) via upsertGroundThreads. Threading is
+  cross-run aware: the source's existing threads (groundThreadsForSource)
+  are offered as append targets, and a continuation — e.g. a retraction
+  arriving a run after its incident — is upserted with threadId set so
+  the server appends to the original thread.
 """
 
 import logging
@@ -24,6 +28,7 @@ from src.clients.claude import ClaudeRateLimited
 from src.clients.graphql import (
     GraphQLClientError,
     ground_messages_for_classification,
+    ground_threads_for_source,
     upsert_ground_message_classifications,
     upsert_ground_threads,
 )
@@ -74,12 +79,28 @@ def classify_ground_messages(self, ground_source_id: str, limit: int = DEFAULT_M
             for m in messages
         ]
 
-        thread_inputs = ground_intel.build_threads(ground_source_id, merged)
+        # Cross-run threading: existing threads are offered as append
+        # targets so a correction/retraction landing in a later run (or the
+        # tail of an incident straddling two fetch windows) joins its
+        # original thread instead of minting an orphan. Only fetched when
+        # there is actually something to thread.
+        has_candidates = any(
+            m.get("classification") == "field_report" and not m.get("threadId")
+            for m in merged
+        )
+        existing_threads = (
+            ground_threads_for_source(ground_source_id) if has_candidates else []
+        )
+
+        thread_inputs = ground_intel.build_threads(
+            ground_source_id, merged, existing_threads
+        )
         thread_rows = upsert_ground_threads(thread_inputs) if thread_inputs else []
         if thread_inputs:
+            appended = sum(1 for t in thread_inputs if t.get("threadId"))
             logger.info(
-                "[GROUND] Source %s: upserted %d incident thread(s)",
-                ground_source_id, len(thread_inputs),
+                "[GROUND] Source %s: upserted %d incident thread(s) (%d appended to existing)",
+                ground_source_id, len(thread_inputs), appended,
             )
 
         return {

@@ -31,11 +31,18 @@ class GroundClassificationResponse(BaseModel):
 
 class GroundThreadProposal(BaseModel):
     """One proposed incident thread, as returned by Claude. Validated and
-    lifecycle-checked deterministically before anything is written back."""
+    lifecycle-checked deterministically before anything is written back.
+
+    `thread_id` set means the proposal APPENDS its message_ids to that
+    existing thread (cross-run threading: a correction or retraction that
+    arrives after its incident was threaded in an earlier run) instead of
+    creating a new one. It must match an offered existing thread id —
+    unknown ids are ignored and the proposal becomes a new thread."""
 
     title: str = ""
     lifecycle_state: str = ""
     message_ids: list[str]
+    thread_id: str | None = None
 
 
 class GroundThreadingResponse(BaseModel):
