@@ -995,6 +995,64 @@ def get_entities_missing_translation(
     return result.get("entitiesMissingTranslation") or []
 
 
+# ─── Ground intel (WhatsApp signal pipeline) ──────────────────────────────
+# Staging-tier surface owned by clear-api (groundSources / groundThreads /
+# groundMessages). Message text arrives already redacted (phone numbers
+# stripped at persistence); senderRef is pseudonymous.
+
+GROUND_MESSAGES_FOR_CLASSIFICATION = """
+query GroundMessagesForClassification($groundSourceId: String!, $limit: Int) {
+  groundMessagesForClassification(groundSourceId: $groundSourceId, limit: $limit) {
+    id
+    text
+    sentAt
+    senderRef
+    hasMedia
+    classification
+    threadId
+  }
+}
+"""
+
+UPSERT_GROUND_MESSAGE_CLASSIFICATIONS = """
+mutation UpsertGroundMessageClassifications(
+  $inputs: [GroundMessageClassificationInput!]!
+) {
+  upsertGroundMessageClassifications(inputs: $inputs) {
+    id
+    classification
+  }
+}
+"""
+
+
+def ground_messages_for_classification(
+    ground_source_id: str,
+    limit: int | None = None,
+) -> list[dict]:
+    """Fetch a ground source's messages awaiting classification/threading.
+
+    The server scopes the result to the source and orders by sentAt; rows
+    carry `classification` / `threadId` as null until this pipeline fills
+    them in.
+    """
+    variables: dict = {"groundSourceId": ground_source_id}
+    if limit is not None:
+        variables["limit"] = limit
+    result = _execute(GROUND_MESSAGES_FOR_CLASSIFICATION, variables)
+    return result.get("groundMessagesForClassification") or []
+
+
+def upsert_ground_message_classifications(inputs: list[dict]) -> list[dict]:
+    """Write classifications back to clear-api. Each input row must shape as
+    {messageId, classification, uncertaintyMarker} — uncertaintyMarker may
+    be None when the contributor attached no uncertainty tag."""
+    if not inputs:
+        return []
+    result = _execute(UPSERT_GROUND_MESSAGE_CLASSIFICATIONS, {"inputs": inputs})
+    return result.get("upsertGroundMessageClassifications") or []
+
+
 def upsert_translations(
     entity_type: str,
     entity_id: str,

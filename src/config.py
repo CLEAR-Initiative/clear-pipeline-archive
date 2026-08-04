@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     # Translation is mostly mechanical (string-to-string with structure
     # preservation) — Haiku handles it well at ~10x the price advantage.
     claude_model_translate: str = "claude-haiku-4-5-20251001"
+    # Ground-intel (WhatsApp signal pipeline). Message triage is a batched
+    # 4-way label task — Haiku territory, like classify/assess.
+    claude_model_ground_classify: str = "claude-haiku-4-5-20251001"
 
     # Translation — comma-separated BCP-47 codes. 'en' is the canonical
     # source and is never a target. Empty string disables translation
