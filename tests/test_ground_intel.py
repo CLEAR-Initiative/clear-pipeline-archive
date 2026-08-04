@@ -159,6 +159,137 @@ class TestClassifyMessages:
         assert mock_call.call_count == 3  # 120 / CLASSIFY_CHUNK_SIZE(50)
 
 
+# ─── uncertainty markers (deterministic) ───────────────────────────────────
+
+
+class TestUncertaintyMarkers:
+    @pytest.mark.parametrize(
+        ("text", "marker"),
+        [
+            ("Several casualties feared. Unconfirmed so far.", "unconfirmed"),
+            ("This is not yet confirmed by anyone.", "unconfirmed"),
+            ("Hearing a rumour of a new checkpoint.", "rumour"),
+            ("Rumors of movement to the south.", "rumour"),
+            ("An unverified report of shelling.", "unverified"),
+            ("The convoy was allegedly stopped en route.", "alleged"),
+            ("Clashes reported near the market this morning.", None),
+            ("", None),
+            (None, None),
+        ],
+    )
+    def test_detects_contributor_uncertainty_tags(self, text, marker):
+        from src.services.ground_intel import detect_uncertainty_marker
+
+        assert detect_uncertainty_marker(text) == marker
+
+    def test_most_cautious_marker_wins_when_several_appear(self):
+        """"Rumour only for now, no confirmation" carries both a rumour tag
+        and an unconfirmed tag — the weaker-credibility one is preserved."""
+        from src.services.ground_intel import detect_uncertainty_marker
+
+        assert detect_uncertainty_marker("Rumour only for now, no confirmation.") == "rumour"
+
+    def test_markers_are_preserved_in_the_classification_write_back(self):
+        """PRD requirement: a source message carrying "unconfirmed" or
+        "rumour" yields a derived signal that preserves that marker."""
+        from src.services import ground_intel
+
+        with patch.object(ground_intel, "call_claude", return_value=CANNED_CLASSIFY):
+            rows = ground_intel.classify_messages(load_messages())
+
+        marker_by_id = {r["messageId"]: r["uncertaintyMarker"] for r in rows}
+        assert marker_by_id["gm_01"] == "unconfirmed"  # "Unconfirmed so far."
+        assert marker_by_id["gm_08"] == "rumour"  # "Rumour only for now..."
+        assert marker_by_id["gm_05"] is None  # news digest, no marker
+        assert marker_by_id["gm_06"] is None  # operational, no marker
+
+
+# ─── lifecycle states ──────────────────────────────────────────────────────
+
+
+class TestLifecycleStates:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("this turned out to be misreporting", True),
+            ("the earlier report was misreported", True),
+            ("we retract yesterday's report", True),
+            ("false alarm, all clear", True),
+            ("the strike did not happen", True),
+            ("Correction: it was not at the grain market", False),
+            ("two more strikes heard from the same direction", False),
+        ],
+    )
+    def test_retraction_detection(self, text, expected):
+        from src.services.ground_intel import is_retraction
+
+        assert is_retraction(text) is expected
+
+    def test_single_message_thread_is_always_reported(self):
+        from src.services.ground_intel import derive_lifecycle_state
+
+        msg = {"text": "Strike reported near the bridge."}
+        assert derive_lifecycle_state("updated", [msg]) == "reported"
+        assert derive_lifecycle_state("confirmed", [msg]) == "reported"
+
+    def test_valid_model_state_passes_through_for_multi_message_threads(self):
+        from src.services.ground_intel import derive_lifecycle_state
+
+        msgs = [{"text": "report"}, {"text": "more detail"}]
+        for state in ("updated", "confirmed", "corrected"):
+            assert derive_lifecycle_state(state, msgs) == state
+
+    def test_invalid_model_state_falls_back_to_updated(self):
+        from src.services.ground_intel import derive_lifecycle_state
+
+        msgs = [{"text": "report"}, {"text": "more detail"}]
+        assert derive_lifecycle_state("escalated", msgs) == "updated"
+        assert derive_lifecycle_state(None, msgs) == "updated"
+
+    def test_retraction_message_overrides_model_state(self):
+        from src.services.ground_intel import derive_lifecycle_state
+
+        msgs = [
+            {"text": "Strikes reported on the compound."},
+            {"text": "This turned out to be misreporting. No strikes took place."},
+        ]
+        # Whatever the model proposed, an explicit withdrawal wins.
+        for state in ("updated", "confirmed", "corrected", None):
+            assert derive_lifecycle_state(state, msgs) == "retracted"
+
+    def test_retraction_fixture_case_sets_thread_state_retracted(self):
+        """Acceptance case (the 13 Apr misreporting pattern): the compound
+        report + its retraction thread ends up `retracted` even when the
+        model proposed a milder state."""
+        from src.services import ground_intel
+
+        proposal = {
+            "threads": [
+                {
+                    "title": "Reported strikes on the Galaxy compound",
+                    "lifecycle_state": "corrected",  # model was too mild
+                    "message_ids": ["gm_09", "gm_10"],
+                }
+            ]
+        }
+        with patch.object(ground_intel, "call_claude", return_value=proposal):
+            threads = ground_intel.build_threads(SOURCE_ID, classified_messages())
+
+        assert threads[0]["messageIds"] == ["gm_09", "gm_10"]
+        assert threads[0]["lifecycleState"] == "retracted"
+
+    def test_correction_chain_stays_corrected_not_retracted(self):
+        """A location correction is a corrected thread — the incident stands.
+        Only an explicit withdrawal flips to retracted."""
+        from src.services import ground_intel
+
+        with patch.object(ground_intel, "call_claude", side_effect=canned_claude):
+            threads = ground_intel.build_threads(SOURCE_ID, classified_messages())
+
+        zalingei = next(t for t in threads if "gm_01" in t["messageIds"])
+        assert zalingei["lifecycleState"] == "corrected"
+
+
 # ─── threading service ─────────────────────────────────────────────────────
 
 

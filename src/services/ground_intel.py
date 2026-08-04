@@ -52,10 +52,14 @@ CLASSIFY_CHUNK_SIZE = 50
 THREAD_BATCH_LIMIT = 150
 
 # ─── Uncertainty markers (deterministic) ───────────────────────────────────
-# Ordered: the first pattern that matches wins. The canonical marker string
-# (left) is what gets persisted — the PRD requires the contributor's own
-# uncertainty tag to survive ingestion, normalised to a stable vocabulary.
+# Ordered weakest-credibility first; the first pattern that matches wins, so
+# a message carrying several markers ("rumour only, no confirmation") keeps
+# the most cautious one. The canonical marker string (left) is what gets
+# persisted — the PRD requires the contributor's own uncertainty tag to
+# survive ingestion, normalised to a stable vocabulary.
 _UNCERTAINTY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("rumour", re.compile(r"\brumou?rs?\b", re.IGNORECASE)),
+    ("unverified", re.compile(r"\bunverified\b", re.IGNORECASE)),
     (
         "unconfirmed",
         re.compile(
@@ -63,10 +67,27 @@ _UNCERTAINTY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
-    ("rumour", re.compile(r"\brumou?rs?\b", re.IGNORECASE)),
-    ("unverified", re.compile(r"\bunverified\b", re.IGNORECASE)),
     ("alleged", re.compile(r"\ballegedl?y?\b", re.IGNORECASE)),
 ]
+
+# ─── Retractions (deterministic override) ──────────────────────────────────
+# "This turned out to be misreporting — no strikes on Galaxy" must flip its
+# thread to `retracted` even if the model calls it something milder. The
+# withdrawal of a report is too consequential to leave to model judgement
+# alone; these phrases are the explicit ways contributors withdraw reports.
+_RETRACTION_PATTERN = re.compile(
+    r"\bmisreport(?:ing|ed)?\b"
+    r"|\bturned\s+out\s+to\s+be\s+(?:false|wrong|untrue|incorrect)\b"
+    r"|\bretract(?:ed|ing|ion)?\b"
+    r"|\bfalse\s+alarm\b"
+    r"|\bdid\s+not\s+(?:happen|take\s+place|occur)\b",
+    re.IGNORECASE,
+)
+
+
+def is_retraction(text: str | None) -> bool:
+    """True when `text` explicitly withdraws an earlier report."""
+    return bool(text and _RETRACTION_PATTERN.search(text))
 
 
 def detect_uncertainty_marker(text: str | None) -> str | None:
@@ -142,9 +163,13 @@ def derive_lifecycle_state(llm_state: str | None, messages: list[dict]) -> str:
 
     The model's judgement is used where the semantics genuinely need it
     (confirmed vs corrected vs updated), but rules set the floor:
+      - a thread containing an explicit retraction is "retracted",
+        whatever the model proposed
       - a single-message thread can only ever be "reported"
       - an out-of-vocabulary state falls back to reported/updated by size
     """
+    if any(is_retraction(m.get("text")) for m in messages):
+        return "retracted"
     if len(messages) <= 1:
         return "reported"
     if llm_state in GROUND_LIFECYCLE_STATES:
