@@ -415,17 +415,14 @@ class TestClassifyGroundMessagesTask:
             patch.object(
                 task_module,
                 "upsert_ground_message_classifications",
-                side_effect=lambda inputs: [
-                    {"id": i["messageId"], "classification": i["classification"]}
-                    for i in inputs
-                ],
+                # Contract v2: the server returns a scalar upserted-row count.
+                side_effect=lambda inputs: len(inputs),
             ) as mock_upsert,
             patch.object(
                 task_module,
                 "upsert_ground_threads",
-                side_effect=lambda inputs: [
-                    {"id": f"gth_{n}"} for n in range(len(inputs))
-                ],
+                # Contract v2: the server returns a scalar list of thread ids.
+                side_effect=lambda inputs: [f"gth_{n}" for n in range(len(inputs))],
             ) as mock_threads,
             patch.object(ground_intel, "call_claude", side_effect=claude),
         ):
@@ -515,6 +512,32 @@ class TestClassifyGroundMessagesTask:
         from src.celery_app import app as celery_app
 
         assert "classify_ground_messages" in celery_app.tasks
+
+    def test_graphql_contract_v2_document_shapes(self):
+        """Tripwire for the canonical clear-api contract (v2): exact input
+        type literals, and SCALAR returns on both mutations — a selection
+        set on a scalar field is a GraphQL validation error server-side."""
+        from src.clients import graphql
+
+        assert (
+            "[GroundMessageClassificationInput!]!"
+            in graphql.UPSERT_GROUND_MESSAGE_CLASSIFICATIONS
+        )
+        # Scalar Int! return — the field call must NOT open a selection set.
+        assert (
+            "upsertGroundMessageClassifications(inputs: $inputs)\n}"
+            in graphql.UPSERT_GROUND_MESSAGE_CLASSIFICATIONS
+        )
+
+        assert "[GroundThreadUpsertInput!]!" in graphql.UPSERT_GROUND_THREADS
+        assert "UpsertGroundThreadInput" not in graphql.UPSERT_GROUND_THREADS
+        # Scalar [String]! return — no selection set here either.
+        assert (
+            "upsertGroundThreads(inputs: $inputs)\n}" in graphql.UPSERT_GROUND_THREADS
+        )
+
+        for field in ("id", "title", "lifecycleState", "reviewState", "messageIds"):
+            assert field in graphql.GROUND_THREADS_FOR_SOURCE
 
     def test_graphql_client_error_is_not_retried(self):
         from src.clients.graphql import GraphQLClientError
