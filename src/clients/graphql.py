@@ -995,6 +995,114 @@ def get_entities_missing_translation(
     return result.get("entitiesMissingTranslation") or []
 
 
+# ─── Ground intel (WhatsApp signal pipeline) ──────────────────────────────
+# Staging-tier surface owned by clear-api (groundSources / groundThreads /
+# groundMessages). Message text arrives already redacted (phone numbers
+# stripped at persistence); senderRef is pseudonymous.
+
+GROUND_MESSAGES_FOR_CLASSIFICATION = """
+query GroundMessagesForClassification($groundSourceId: String!, $limit: Int) {
+  groundMessagesForClassification(groundSourceId: $groundSourceId, limit: $limit) {
+    id
+    text
+    sentAt
+    senderRef
+    hasMedia
+    classification
+    threadId
+  }
+}
+"""
+
+UPSERT_GROUND_MESSAGE_CLASSIFICATIONS = """
+mutation UpsertGroundMessageClassifications(
+  $inputs: [GroundMessageClassificationInput!]!
+) {
+  upsertGroundMessageClassifications(inputs: $inputs)
+}
+"""
+
+
+def ground_messages_for_classification(
+    ground_source_id: str,
+    limit: int | None = None,
+) -> list[dict]:
+    """Fetch a ground source's messages awaiting classification/threading.
+
+    The server scopes the result to the source and orders by sentAt; rows
+    carry `classification` / `threadId` as null until this pipeline fills
+    them in.
+    """
+    variables: dict = {"groundSourceId": ground_source_id}
+    if limit is not None:
+        variables["limit"] = limit
+    result = _execute(GROUND_MESSAGES_FOR_CLASSIFICATION, variables)
+    return result.get("groundMessagesForClassification") or []
+
+
+def upsert_ground_message_classifications(inputs: list[dict]) -> int:
+    """Write classifications back to clear-api. Each input row must shape as
+    {messageId, classification, uncertaintyMarker} — uncertaintyMarker may
+    be None when the contributor attached no uncertainty tag. The server
+    returns a scalar count of upserted rows."""
+    if not inputs:
+        return 0
+    result = _execute(UPSERT_GROUND_MESSAGE_CLASSIFICATIONS, {"inputs": inputs})
+    return result.get("upsertGroundMessageClassifications") or 0
+
+
+GROUND_THREADS_FOR_SOURCE = """
+query GroundThreadsForSource($groundSourceId: String!, $states: [String!]) {
+  groundThreadsForSource(groundSourceId: $groundSourceId, states: $states) {
+    id
+    title
+    lifecycleState
+    reviewState
+    messageIds
+  }
+}
+"""
+
+
+def ground_threads_for_source(
+    ground_source_id: str,
+    states: list[str] | None = None,
+) -> list[dict]:
+    """Fetch a source's existing incident threads.
+
+    Used before the threading stage so a later run can APPEND to a thread
+    created by an earlier run (a correction or retraction that arrives
+    after its incident was threaded) instead of minting an orphan thread.
+    `states` optionally filters by lifecycle state.
+    """
+    variables: dict = {"groundSourceId": ground_source_id}
+    if states is not None:
+        variables["states"] = states
+    result = _execute(GROUND_THREADS_FOR_SOURCE, variables)
+    return result.get("groundThreadsForSource") or []
+
+
+UPSERT_GROUND_THREADS = """
+mutation UpsertGroundThreads($inputs: [GroundThreadUpsertInput!]!) {
+  upsertGroundThreads(inputs: $inputs)
+}
+"""
+
+
+def upsert_ground_threads(inputs: list[dict]) -> list[str | None]:
+    """Create/update incident threads and attach their messages. Each input
+    row shapes as {groundSourceId, title, lifecycleState, messageIds} plus
+    an optional threadId — when threadId is set, the server APPENDS the
+    messageIds to that existing (non-promoted) thread and updates its
+    lifecycleState/title instead of creating a new thread. Returns thread
+    ids index-aligned with `inputs` (entries may be null for rejected rows).
+    """
+    if not inputs:
+        return []
+    result = _execute(UPSERT_GROUND_THREADS, {"inputs": inputs})
+    return result.get("upsertGroundThreads") or []
+
+
 def upsert_translations(
     entity_type: str,
     entity_id: str,
