@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     acled_source_name: str = "acled"
     acled_token_ttl: int = 23 * 3600  # 23 hours (valid 24h)
 
+    # darfur24.com (Sudanese news outlet — public WordPress RSS, no auth).
+    # Comma-separated feed URLs. English edition by default; the Arabic
+    # primary edition lives at https://darfur24.com/feed/ — see
+    # src/clients/darfur24.py for the duplicate-story caveat before adding it.
+    darfur24_feed_urls: str = "https://darfur24.com/en/feed/"
+    darfur24_poll_interval_minutes: int = 30
+    darfur24_source_name: str = "darfur24"
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 

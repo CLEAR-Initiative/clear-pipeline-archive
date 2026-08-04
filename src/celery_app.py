@@ -75,6 +75,10 @@ app.conf.beat_schedule = {
         "task": "src.tasks.poll_acled.poll_acled",
         "schedule": timedelta(minutes=settings.acled_poll_interval_minutes),
     },
+    "poll-darfur24": {
+        "task": "src.tasks.poll_darfur24.poll_darfur24",
+        "schedule": timedelta(minutes=settings.darfur24_poll_interval_minutes),
+    },
     # Daily digest — every day at 07:00 UTC
     "daily-alert-digest": {
         "task": "src.tasks.notify.send_daily_digest",

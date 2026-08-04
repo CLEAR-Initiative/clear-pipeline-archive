@@ -103,6 +103,7 @@ The DoD for the ticket calls for "a detailed datasource table, including purpose
 | Dataminr | 1          | Primary real-time signal supply       | OAuth2 client credentials (`/auth/v1/token`)      | Poll every 15s, 7d backlog | Sudan (alert lists)  | **Live**               |
 | GADM     | 7          | Admin boundaries for location resolve | Public dataset, loaded into `locations` (PostGIS) | One-off load               | Sudan (v1)           | Partial; see §6        |
 | ACLED    | 3          | Fastfollow curated conflict data      | Keyed API                                         | TBD                        | Country-configurable | Planned                |
+| darfur24 | 1          | Sudanese news reporting (most-cited source in the HSS DAO group) | Public WordPress RSS (`/en/feed/`), no auth | Poll every 30 min | Sudan / Darfur | **Live** (signals only; classification wiring is a follow-up) |
 | FEWS NET | 5          | Food-security forecasts               | Public feeds                                      | Monthly                    | National             | Planned                |
 | Claude   | n/a        | ML reasoning, not a data source       | Anthropic API                                     | Per-signal                 | —                    | Live (sonnet-4-6 v0.1) |
 
