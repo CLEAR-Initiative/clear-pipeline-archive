@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     darfur24_feed_urls: str = "https://darfur24.com/en/feed/"
     darfur24_poll_interval_minutes: int = 30
     darfur24_source_name: str = "darfur24"
+    # Country whose L0 location every darfur24 signal is attached to.
+    # News articles carry no structured coordinates, but a signal without a
+    # location is invisible in every country-scoped UI view (signalsPage
+    # filters by location descendants) — so we pin signals to the outlet's
+    # deployment country and leave finer-grained resolution to the
+    # classification follow-up. Must match a level-0 location `name` in the
+    # CLEAR API (expo-385).
+    darfur24_default_country: str = "Sudan"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
