@@ -5,11 +5,17 @@ from datetime import UTC, datetime
 
 from src.celery_app import app
 from src.clients.darfur24 import fetch_darfur24_articles, get_last_synced, mark_seen
-from src.clients.graphql import GraphQLClientError, create_signal, get_data_sources
+from src.clients.graphql import (
+    GraphQLClientError,
+    create_signal,
+    get_data_sources,
+    get_locations_by_level,
+)
 
 logger = logging.getLogger(__name__)
 
 _darfur24_source_id: str | None = None
+_darfur24_location_id: str | None = None
 
 
 def _get_darfur24_source_id() -> str:
@@ -30,15 +36,50 @@ def _get_darfur24_source_id() -> str:
     )
 
 
-def _build_signal_input(article: dict, source_id: str) -> dict:
+def _get_darfur24_location_id() -> str | None:
+    """Resolve `darfur24_default_country`'s L0 location id (cached).
+
+    Best-effort by design: returns None — after logging a warning — when the
+    lookup fails or the country has no level-0 row. Signal creation must not
+    fail because the location could not be resolved; a location-less signal
+    is still recoverable via updateSignalLocation, a dropped article is not
+    (expo-385). Only a successful resolution is cached, so a transient API
+    error is retried on the next poll round.
+    """
+    global _darfur24_location_id
+    if _darfur24_location_id is not None:
+        return _darfur24_location_id
+
+    from src.config import settings
+    try:
+        for loc in get_locations_by_level(0):
+            if loc["name"] == settings.darfur24_default_country:
+                _darfur24_location_id = loc["id"]
+                return _darfur24_location_id
+        logger.warning(
+            "[DARFUR24] No level-0 location named %r in CLEAR API; "
+            "creating signals without location",
+            settings.darfur24_default_country,
+        )
+    except Exception as e:
+        logger.warning(
+            "[DARFUR24] Failed to resolve level-0 location for %r: %s; "
+            "creating signals without location",
+            settings.darfur24_default_country,
+            e,
+        )
+    return None
+
+
+def _build_signal_input(article: dict, source_id: str, location_id: str | None) -> dict:
     """Convert a parsed darfur24 article into a CLEAR CreateSignalInput dict.
 
-    News articles carry no structured severity, casualty, or coordinate data
-    — unlike ACLED/GDACS we deliberately set none of those. Severity stays
-    unset rather than invented; location/classification enrichment is the
+    News articles carry no structured casualty or coordinate data — unlike
+    ACLED/GDACS we deliberately set none of those. Location is the country
+    L0 (see `darfur24_default_country`); finer-grained resolution is the
     classification follow-up, not this tracer.
     """
-    return {
+    input_data = {
         "sourceId": source_id,
         # Dedup key — (sourceId, externalId) is unique in the CLEAR API, so
         # re-ingesting the same article (Redis seen-set expired, feed replay)
@@ -49,7 +90,15 @@ def _build_signal_input(article: dict, source_id: str) -> dict:
         "url": article["url"],
         "title": article["title"],
         "description": article.get("description"),
+        # Documented informational default for news-source signals: 1 is the
+        # scale floor ("informational"), not an estimated threat level. A
+        # null severity makes the signal vanish from any severity-filtered
+        # view (the API's gte/lte range filter drops null rows) — expo-385.
+        "severity": 1,
     }
+    if location_id is not None:
+        input_data["locationId"] = location_id
+    return input_data
 
 
 @app.task(name="src.tasks.poll_darfur24.poll_darfur24", bind=True, max_retries=3)
@@ -80,14 +129,19 @@ def poll_darfur24(self):
             return {"articles_found": 0, "signals_created": 0}
 
         source_id = _get_darfur24_source_id()
-        logger.info("[DARFUR24] Creating signals using source_id=%s", source_id)
+        location_id = _get_darfur24_location_id()  # None → no location (best-effort)
+        logger.info(
+            "[DARFUR24] Creating signals using source_id=%s location_id=%s",
+            source_id,
+            location_id,
+        )
 
         created_count = 0
         failed_count = 0
 
         for article in articles:
             try:
-                input_data = _build_signal_input(article, source_id)
+                input_data = _build_signal_input(article, source_id, location_id)
                 created = create_signal(input_data)
                 logger.info(
                     "[DARFUR24] Signal created: id=%s title=%s",

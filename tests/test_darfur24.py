@@ -207,7 +207,7 @@ class TestBuildSignalInput:
     def test_external_id_is_darfur24_slug(self):
         from src.tasks.poll_darfur24 import _build_signal_input
 
-        input_data = _build_signal_input(self._article(), "src_123")
+        input_data = _build_signal_input(self._article(), "src_123", None)
         assert input_data["externalId"] == f"darfur24:{EN_SLUG}"
         assert input_data["sourceId"] == "src_123"
 
@@ -215,7 +215,7 @@ class TestBuildSignalInput:
         from src.tasks.poll_darfur24 import _build_signal_input
 
         article = self._article()
-        input_data = _build_signal_input(article, "src_123")
+        input_data = _build_signal_input(article, "src_123", None)
 
         assert input_data["title"] == article["title"]
         assert input_data["description"] == article["description"]
@@ -223,19 +223,46 @@ class TestBuildSignalInput:
         assert input_data["publishedAt"] == article["published_at"]
         assert input_data["rawData"] == article["raw"]
 
-    def test_no_invented_severity_or_coordinates(self):
-        """News articles carry no structured severity/casualty/coordinate
-        data — the input must not fabricate any (unlike ACLED/GDACS)."""
+    def test_severity_is_informational_floor(self):
+        """expo-385: severity 1 is the documented informational default for
+        news-source signals — without it the API's gte/lte severity filter
+        silently drops the (null-severity) row from every filtered view."""
         from src.tasks.poll_darfur24 import _build_signal_input
 
-        input_data = _build_signal_input(self._article(), "src_123")
-        for forbidden in ("severity", "casualties", "lat", "lng"):
+        input_data = _build_signal_input(self._article(), "src_123", None)
+        assert input_data["severity"] == 1
+
+    def test_location_id_set_when_resolved(self):
+        """expo-385: signals carry the deployment country's L0 location so
+        country-scoped views (location-descendant filter) can see them."""
+        from src.tasks.poll_darfur24 import _build_signal_input
+
+        input_data = _build_signal_input(self._article(), "src_123", "loc_sdn")
+        assert input_data["locationId"] == "loc_sdn"
+
+    def test_location_id_omitted_when_unresolved(self):
+        """A failed location resolution must degrade to a location-less
+        signal, not a null-valued locationId field."""
+        from src.tasks.poll_darfur24 import _build_signal_input
+
+        input_data = _build_signal_input(self._article(), "src_123", None)
+        assert "locationId" not in input_data
+
+    def test_no_invented_casualties_or_coordinates(self):
+        """News articles carry no structured casualty/coordinate data — the
+        input must not fabricate any (unlike ACLED/GDACS)."""
+        from src.tasks.poll_darfur24 import _build_signal_input
+
+        input_data = _build_signal_input(self._article(), "src_123", None)
+        for forbidden in ("casualties", "lat", "lng"):
             assert forbidden not in input_data
 
     def test_missing_published_at_falls_back_to_now(self):
         from src.tasks.poll_darfur24 import _build_signal_input
 
-        input_data = _build_signal_input(self._article(published_at=None), "src_123")
+        input_data = _build_signal_input(
+            self._article(published_at=None), "src_123", None
+        )
         assert input_data["publishedAt"]  # non-empty ISO timestamp
 
 
@@ -253,6 +280,11 @@ class TestPollTask:
                 task_module,
                 "get_data_sources",
                 return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module,
+                "get_locations_by_level",
+                return_value=[{"id": "loc_sdn", "name": "Sudan"}],
             ),
             patch.object(
                 task_module, "create_signal", return_value={"id": "sig_1"}
@@ -312,6 +344,11 @@ class TestPollTask:
                 return_value=[{"id": "src_d24", "name": "darfur24"}],
             ),
             patch.object(
+                task_module,
+                "get_locations_by_level",
+                return_value=[{"id": "loc_sdn", "name": "Sudan"}],
+            ),
+            patch.object(
                 task_module, "create_signal", return_value={"id": "sig_1"}
             ) as mock_create,
         ):
@@ -341,6 +378,11 @@ class TestPollTask:
                 "get_data_sources",
                 return_value=[{"id": "src_d24", "name": "darfur24"}],
             ),
+            patch.object(
+                task_module,
+                "get_locations_by_level",
+                return_value=[{"id": "loc_sdn", "name": "Sudan"}],
+            ),
             patch.object(task_module, "create_signal", side_effect=flaky_create),
         ):
             result = task_module.poll_darfur24.apply().get()
@@ -351,11 +393,108 @@ class TestPollTask:
         # retries exactly that one (and only that one).
         assert retry == {"articles_found": 1, "signals_created": 1, "failed": 0}
 
+    def test_signals_carry_country_location_and_severity(self, fake_redis, recorded_feed):
+        """expo-385 acceptance: every created signal carries the resolved L0
+        locationId and severity 1, and the L0 lookup is cached module-level
+        (one GraphQL call across repeated polls)."""
+        from src.tasks import poll_darfur24 as task_module
+
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module,
+                "get_locations_by_level",
+                return_value=[
+                    {"id": "loc_afg", "name": "Afghanistan"},
+                    {"id": "loc_sdn", "name": "Sudan"},
+                ],
+            ) as mock_locations,
+            patch.object(
+                task_module, "create_signal", return_value={"id": "sig_1"}
+            ) as mock_create,
+        ):
+            task_module.poll_darfur24.apply().get()
+
+            # Replay the feed: articles are new again (seen-set cleared) but
+            # the location id must come from the module-level cache.
+            for key in list(fake_redis.store):
+                if key.startswith("darfur24:seen:"):
+                    del fake_redis.store[key]
+            task_module.poll_darfur24.apply().get()
+
+        assert mock_create.call_count == 6
+        for call in mock_create.call_args_list:
+            assert call.args[0]["locationId"] == "loc_sdn"
+            assert call.args[0]["severity"] == 1
+        assert mock_locations.call_count == 1  # cached after first resolution
+        assert mock_locations.call_args.args == (0,)  # L0 lookup
+
+    def test_location_resolution_failure_degrades_gracefully(
+        self, fake_redis, recorded_feed
+    ):
+        """expo-385: a failing L0 lookup must not sink signal creation — the
+        signals are still created (severity 1), just without a location."""
+        from src.tasks import poll_darfur24 as task_module
+
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module,
+                "get_locations_by_level",
+                side_effect=RuntimeError("api down"),
+            ),
+            patch.object(
+                task_module, "create_signal", return_value={"id": "sig_1"}
+            ) as mock_create,
+        ):
+            result = task_module.poll_darfur24.apply().get()
+
+        assert result == {"articles_found": 3, "signals_created": 3, "failed": 0}
+        for call in mock_create.call_args_list:
+            assert "locationId" not in call.args[0]
+            assert call.args[0]["severity"] == 1
+
+    def test_unknown_country_degrades_gracefully(self, fake_redis, recorded_feed):
+        """expo-385: a country name with no matching L0 row behaves like a
+        failed lookup — warn and create signals without location."""
+        from src.tasks import poll_darfur24 as task_module
+
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module,
+                "get_locations_by_level",
+                return_value=[{"id": "loc_afg", "name": "Afghanistan"}],
+            ),
+            patch.object(
+                task_module, "create_signal", return_value={"id": "sig_1"}
+            ) as mock_create,
+        ):
+            result = task_module.poll_darfur24.apply().get()
+
+        assert result == {"articles_found": 3, "signals_created": 3, "failed": 0}
+        for call in mock_create.call_args_list:
+            assert "locationId" not in call.args[0]
+
 
 @pytest.fixture(autouse=True)
-def _reset_source_id_cache():
-    """The poll task caches the source id at module level; isolate tests."""
+def _reset_module_caches():
+    """The poll task caches the source id and country location id at module
+    level; isolate tests."""
     yield
     import src.tasks.poll_darfur24 as task_module
 
     task_module._darfur24_source_id = None
+    task_module._darfur24_location_id = None
