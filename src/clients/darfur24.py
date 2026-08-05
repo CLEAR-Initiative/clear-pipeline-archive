@@ -15,7 +15,10 @@ near-duplicate signals with different slugs.
 
 Each feed serves the ~10 most recent articles. Dedup is two-layered:
   1. Redis seen-set (`darfur24:seen:{slug}`, `dedup_ttl_hours` TTL) stops us
-     re-emitting an article across poll rounds.
+     re-emitting an article across poll rounds. Fetching only *reads* the
+     seen-set; articles are marked via `mark_seen()` — called by the poll
+     task once signal creation succeeded — so a failed or skipped creation
+     leaves the article eligible for the next poll (expo-383).
   2. The CLEAR API's (sourceId, externalId) uniqueness — externalId is
      `darfur24:{slug}` — keeps createSignal idempotent even after the Redis
      TTL expires (the API returns the existing row instead of inserting).
@@ -150,6 +153,12 @@ def fetch_darfur24_articles() -> list[dict]:
     parses the whole feed and relies on the Redis seen-set plus the API's
     (sourceId, externalId) uniqueness to stay idempotent.
 
+    This function only *reads* the seen-set. It never marks articles seen —
+    that is the caller's job via `mark_seen()`, after the article's signal
+    has actually been created (or confirmed as an existing row) in the CLEAR
+    API. Marking during fetch would permanently skip articles whose creation
+    failed (expo-383).
+
     Returns a list of normalized article dicts.
     """
     feed_urls = [u.strip() for u in settings.darfur24_feed_urls.split(",") if u.strip()]
@@ -171,6 +180,7 @@ def fetch_darfur24_articles() -> list[dict]:
 
     # Parse and deduplicate
     articles: list[dict] = []
+    batch_slugs: set[str] = set()
     parse_failed = 0
     deduped = 0
     for item in all_items:
@@ -179,12 +189,12 @@ def fetch_darfur24_articles() -> list[dict]:
             parse_failed += 1
             continue
 
-        dedup_key = f"darfur24:seen:{parsed['darfur24_id']}"
-        if _redis.exists(dedup_key):
+        slug = parsed["darfur24_id"]
+        if slug in batch_slugs or _redis.exists(f"darfur24:seen:{slug}"):
             deduped += 1
             continue
 
-        _redis.setex(dedup_key, settings.dedup_ttl_hours * 3600, "1")
+        batch_slugs.add(slug)
         articles.append(parsed)
 
     if articles:
@@ -195,6 +205,17 @@ def fetch_darfur24_articles() -> list[dict]:
         len(articles), parse_failed, deduped, len(all_items),
     )
     return articles
+
+
+def mark_seen(slug: str) -> None:
+    """Mark one article as ingested in the Redis seen-set.
+
+    Called by the poll task only after the CLEAR API confirmed the signal
+    (created, or returned the existing row for a duplicate externalId).
+    Never called for articles whose creation failed — those must stay
+    eligible for the next poll round.
+    """
+    _redis.setex(f"darfur24:seen:{slug}", settings.dedup_ttl_hours * 3600, "1")
 
 
 def get_last_synced() -> datetime | None:

@@ -4,7 +4,7 @@ import logging
 from datetime import UTC, datetime
 
 from src.celery_app import app
-from src.clients.darfur24 import fetch_darfur24_articles, get_last_synced
+from src.clients.darfur24 import fetch_darfur24_articles, get_last_synced, mark_seen
 from src.clients.graphql import GraphQLClientError, create_signal, get_data_sources
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,11 @@ def poll_darfur24(self):
                     article.get("title", "")[:80],
                 )
                 created_count += 1
+                # Only now — after the API confirmed the signal (created, or
+                # returned the existing row for a duplicate externalId) — is
+                # the article marked seen in Redis. A failed creation leaves
+                # it unmarked so the next poll retries it (expo-383).
+                mark_seen(article["darfur24_id"])
 
             except Exception as e:
                 failed_count += 1

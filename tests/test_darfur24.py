@@ -134,20 +134,54 @@ class TestFeedParsing:
 
 class TestDedupe:
     def test_second_poll_returns_no_articles(self, fake_redis, recorded_feed):
-        """The Redis seen-set must swallow a full feed replay."""
+        """The Redis seen-set must swallow a full feed replay — once the
+        articles have been marked seen (which the poll task does after
+        signal creation)."""
         first = darfur24.fetch_darfur24_articles()
+        for article in first:
+            darfur24.mark_seen(article["darfur24_id"])
         second = darfur24.fetch_darfur24_articles()
 
         assert len(first) == 3
         assert second == []
 
+    def test_fetch_does_not_mark_seen(self, fake_redis, recorded_feed):
+        """Regression (expo-383): fetching must NOT touch the seen-set —
+        marking happens only after successful signal creation. A fetch whose
+        downstream creation fails must leave every article re-fetchable."""
+        first = darfur24.fetch_darfur24_articles()
+
+        assert len(first) == 3
+        assert not any(k.startswith("darfur24:seen:") for k in fake_redis.store)
+
+        # Nothing was marked → a replay yields the same articles again.
+        second = darfur24.fetch_darfur24_articles()
+        assert len(second) == 3
+
+    def test_single_fetch_dedupes_within_batch(self, fake_redis, monkeypatch):
+        """Two configured feeds serving the same items must not yield the
+        same slug twice in one fetch (there is no Redis write in between)."""
+        body = FIXTURE.read_text(encoding="utf-8")
+        monkeypatch.setattr(darfur24, "_fetch_feed", lambda url: body)
+        monkeypatch.setattr(
+            darfur24.settings, "darfur24_feed_urls",
+            "https://darfur24.com/en/feed/,https://darfur24.com/feed/",
+        )
+
+        articles = darfur24.fetch_darfur24_articles()
+        slugs = [a["darfur24_id"] for a in articles]
+        assert len(slugs) == len(set(slugs)) == 3
+
     def test_seen_keys_are_slug_scoped(self, fake_redis, recorded_feed):
-        darfur24.fetch_darfur24_articles()
+        darfur24.mark_seen(EN_SLUG)
         assert f"darfur24:seen:{EN_SLUG}" in fake_redis.store
 
     def test_last_synced_set_only_when_new_articles(self, fake_redis, recorded_feed):
         darfur24.fetch_darfur24_articles()
         assert darfur24.get_last_synced() is not None
+
+        for article in darfur24.fetch_darfur24_articles():
+            darfur24.mark_seen(article["darfur24_id"])
 
         stamp = fake_redis.store["darfur24:last_synced"]
         darfur24.fetch_darfur24_articles()  # all deduped → no update
@@ -251,6 +285,45 @@ class TestPollTask:
 
         assert "darfur24" in str(excinfo.value)
 
+    def test_missing_source_marks_nothing_then_next_run_ingests_all(
+        self, fake_redis, recorded_feed
+    ):
+        """Regression (expo-383, observed on dev 4-5 Aug 2026): polls that ran
+        before the darfur24 data_sources row existed marked every article
+        seen without creating any signal — `already_seen=10,
+        signals_created=0` forever after. A failed run must mark NOTHING so
+        the next successful run ingests every article exactly once."""
+        from src.tasks import poll_darfur24 as task_module
+
+        # Round 1: the data source row does not exist yet → the poll fails …
+        with patch.object(task_module, "get_data_sources", return_value=[]):
+            with pytest.raises(Exception):
+                task_module.poll_darfur24.apply(throw=True).get()
+
+        # … and the seen-set must be untouched.
+        assert not any(k.startswith("darfur24:seen:") for k in fake_redis.store)
+
+        # Round 2: source row now exists → all articles ingest exactly once.
+        task_module._darfur24_source_id = None
+        with (
+            patch.object(
+                task_module,
+                "get_data_sources",
+                return_value=[{"id": "src_d24", "name": "darfur24"}],
+            ),
+            patch.object(
+                task_module, "create_signal", return_value={"id": "sig_1"}
+            ) as mock_create,
+        ):
+            result = task_module.poll_darfur24.apply().get()
+            replay = task_module.poll_darfur24.apply().get()
+
+        assert result == {"articles_found": 3, "signals_created": 3, "failed": 0}
+        assert replay == {"articles_found": 0, "signals_created": 0}
+        assert mock_create.call_count == 3
+        external_ids = [c.args[0]["externalId"] for c in mock_create.call_args_list]
+        assert len(external_ids) == len(set(external_ids)) == 3
+
     def test_one_bad_article_does_not_sink_the_batch(self, fake_redis, recorded_feed):
         from src.tasks import poll_darfur24 as task_module
 
@@ -271,8 +344,12 @@ class TestPollTask:
             patch.object(task_module, "create_signal", side_effect=flaky_create),
         ):
             result = task_module.poll_darfur24.apply().get()
+            retry = task_module.poll_darfur24.apply().get()
 
         assert result == {"articles_found": 3, "signals_created": 2, "failed": 1}
+        # expo-383: the failed article was NOT marked seen, so the next poll
+        # retries exactly that one (and only that one).
+        assert retry == {"articles_found": 1, "signals_created": 1, "failed": 0}
 
 
 @pytest.fixture(autouse=True)
