@@ -7,6 +7,8 @@ dependencies = [
     "celery[redis]>=5.4",
     "redis>=5.0",
     "httpx>=0.28",
+    # ArcGIS FeatureServer client (src/clients/arcgis.py) uses requests.Session.
+    "requests>=2.32",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "anthropic>=0.52",

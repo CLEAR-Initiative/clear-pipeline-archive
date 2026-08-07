@@ -31,12 +31,35 @@ class Settings(BaseSettings):
     acled_source_name: str = "acled"
     acled_token_ttl: int = 23 * 3600  # 23 hours (valid 24h)
 
+    # darfur24.com (Sudanese news outlet — public WordPress RSS, no auth).
+    # Comma-separated feed URLs. English edition by default; the Arabic
+    # primary edition lives at https://darfur24.com/feed/ — see
+    # src/clients/darfur24.py for the duplicate-story caveat before adding it.
+    darfur24_feed_urls: str = "https://darfur24.com/en/feed/"
+    darfur24_poll_interval_minutes: int = 30
+    darfur24_source_name: str = "darfur24"
+    # Country whose L0 location every darfur24 signal is attached to.
+    # News articles carry no structured coordinates, but a signal without a
+    # location is invisible in every country-scoped UI view (signalsPage
+    # filters by location descendants) — so we pin signals to the outlet's
+    # deployment country and leave finer-grained resolution to the
+    # classification follow-up. Must match a level-0 location `name` in the
+    # CLEAR API (expo-385).
+    darfur24_default_country: str = "Sudan"
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
     # CLEAR API
     clear_api_url: str = "http://localhost:4000/graphql"
     clear_api_key: str = ""
+
+    # LogIE roads & bridges (ArcGIS FeatureServers → locationMetadata).
+    # Monthly sync; iso3 list is comma-separated. The roads view is multi-
+    # country (covers SDN/AFG/VEN/SSD); bridges is world-wide LogIE.
+    logie_roads_url: str = "https://services3.arcgis.com/t6lYS2Pmd8iVx1fy/arcgis/rest/services/Situational_Roads_view/FeatureServer/0"
+    logie_bridges_url: str = "https://gis.logcluster.org/server/rest/services/LogIE/wld_trs_bridges_b_w_viewer/FeatureServer/0"
+    logistics_iso3: str = "SDN,AFG,VEN"
 
     # Anthropic
     anthropic_api_key: str = ""
@@ -62,6 +85,11 @@ class Settings(BaseSettings):
     # Translation is mostly mechanical (string-to-string with structure
     # preservation) — Haiku handles it well at ~10x the price advantage.
     claude_model_translate: str = "claude-haiku-4-5-20251001"
+    # Ground-intel (WhatsApp signal pipeline). Message triage is a batched
+    # 4-way label task — Haiku territory, like classify/assess. Threading is
+    # a cross-message clustering judgement — stays on the default model.
+    claude_model_ground_classify: str = "claude-haiku-4-5-20251001"
+    claude_model_ground_thread: str = ""  # "" → falls back to claude_model
 
     # Translation — comma-separated BCP-47 codes. 'en' is the canonical
     # source and is never a target. Empty string disables translation

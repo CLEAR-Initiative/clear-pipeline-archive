@@ -1,0 +1,92 @@
+[
+  {
+    "id": "gm_01",
+    "text": "Reports of a drone strike on the eastern side of Zalingei this morning, near the grain market. Several casualties feared. Unconfirmed so far.",
+    "sentAt": "2026-04-12T07:41:00+00:00",
+    "senderRef": "member_03",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_02",
+    "text": "Correction on the strike this morning: it was not at the grain market, it hit close to the water point on the road north of town.",
+    "sentAt": "2026-04-12T08:10:00+00:00",
+    "senderRef": "member_03",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_03",
+    "text": "Two more strikes heard from the same direction in the last hour. Families are moving away from the north road.",
+    "sentAt": "2026-04-12T09:02:00+00:00",
+    "senderRef": "member_07",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_04",
+    "text": "Smoke visible over the north road now",
+    "sentAt": "2026-04-12T09:05:00+00:00",
+    "senderRef": "member_07",
+    "hasMedia": true,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_05",
+    "text": "Daily roundup: fighting continues around the state capital per agency wires; an aid convoy reached the eastern locality yesterday; markets in the south partially reopened. Sources: radio bulletins and agency reporting.",
+    "sentAt": "2026-04-12T10:30:00+00:00",
+    "senderRef": "member_01",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_06",
+    "text": "All staff please share your movement plans for tomorrow with the security focal point before 17:00.",
+    "sentAt": "2026-04-12T15:00:00+00:00",
+    "senderRef": "member_02",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_07",
+    "text": "Thanks everyone, have a good evening.",
+    "sentAt": "2026-04-12T17:45:00+00:00",
+    "senderRef": "member_05",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_08",
+    "text": "Hearing a rumour of a new checkpoint being set up on the west road out of town. Rumour only for now, no confirmation.",
+    "sentAt": "2026-04-12T18:20:00+00:00",
+    "senderRef": "member_04",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_09",
+    "text": "Strikes reported this evening on the Galaxy compound south of town. Details to follow.",
+    "sentAt": "2026-04-12T19:40:00+00:00",
+    "senderRef": "member_06",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  },
+  {
+    "id": "gm_10",
+    "text": "About yesterday's report on the Galaxy compound: this turned out to be misreporting. No strikes on the compound took place.",
+    "sentAt": "2026-04-13T08:15:00+00:00",
+    "senderRef": "member_06",
+    "hasMedia": false,
+    "classification": null,
+    "threadId": null
+  }
+]

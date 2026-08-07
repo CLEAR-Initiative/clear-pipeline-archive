@@ -75,6 +75,10 @@ app.conf.beat_schedule = {
         "task": "src.tasks.poll_acled.poll_acled",
         "schedule": timedelta(minutes=settings.acled_poll_interval_minutes),
     },
+    "poll-darfur24": {
+        "task": "src.tasks.poll_darfur24.poll_darfur24",
+        "schedule": timedelta(minutes=settings.darfur24_poll_interval_minutes),
+    },
     # Daily digest — every day at 07:00 UTC
     "daily-alert-digest": {
         "task": "src.tasks.notify.send_daily_digest",
@@ -103,6 +107,13 @@ app.conf.beat_schedule = {
     "backfill-dtm-displacement": {
         "task": "src.tasks.dtm.backfill_dtm_displacement",
         "schedule": crontab(hour=2, minute=0, day_of_week=1),
+    },
+    # Monthly LogIE roads & bridges refresh — 1st of month, 02:30 UTC.
+    # Refreshes locationMetadata(type="logie_roads" / "logie_bridges") per
+    # A0 country for settings.logistics_iso3 (SDN, AFG, VEN).
+    "backfill-logistics-infrastructure": {
+        "task": "src.tasks.logistics.backfill_logistics_infrastructure",
+        "schedule": crontab(hour=2, minute=30, day_of_month=1),
     },
 }
 

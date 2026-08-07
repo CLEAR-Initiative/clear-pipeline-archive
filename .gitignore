@@ -15,3 +15,4 @@ venv/
 .pytest_cache/
 *.log
 .DS_Store
+.exponential/
