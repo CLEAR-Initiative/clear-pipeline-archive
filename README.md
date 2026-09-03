@@ -1,6 +1,11 @@
-# CLEAR Pipeline
+# CLEAR Pipeline (archived)
 
-> **Status: In Development** — This project is under active development and not yet production-ready.
+> **⚠️ Archived — no longer maintained or deployed.**
+> This is the original Celery-based CLEAR pipeline. It has been **superseded by
+> [`clear-pipeline`](https://github.com/CLEAR-Initiative/clear-pipeline)**
+> (formerly `clear-context-pipeline`), the Dagster-based pipeline that now owns
+> signal ingestion, event grouping, alerting, and crisis enrichment. This repo
+> is kept read-only for historical reference — do not build against it.
 
 Data ingestion + enrichment pipeline that ingests signals from multiple
 external sources (Dataminr, ACLED, GDACS, and manual entries), classifies and

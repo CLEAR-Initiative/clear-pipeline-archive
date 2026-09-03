@@ -4,7 +4,7 @@ Part of the **WhatsApp Signal Pipeline** (V1 seeded shared core). clear-api owns
 data — the `groundSources` / `groundThreads` / `groundMessages` staging tier sitting in
 front of the `signals → events → alerts` graph — and this pipeline owns the
 intelligence, mirroring the Dataminr split. This work is deliberately a **Celery task on
-clear-pipeline** (not a Dagster asset in clear-context-pipeline): it is operational
+clear-pipeline-archive** (not a Dagster asset in clear-pipeline): it is operational
 signal triage, not Layer-3 knowledge-base work.
 
 ## Task contract
